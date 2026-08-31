@@ -1,870 +1,321 @@
 from __future__ import annotations
 
-import json
-import time
+from pathlib import Path
 
-from click.testing import CliRunner
-import pytest
-from rich.console import Console
 import yaml
+from click.testing import CliRunner
 
 from twitter_cli.cli import cli
-from twitter_cli.formatter import article_to_markdown, print_tweet_table
-from twitter_cli.models import Author, BookmarkFolder, Metrics, Tweet, UserProfile
-from twitter_cli.serialization import tweets_to_json
+from twitter_cli.formatter import article_to_markdown
+from twitter_cli.models import BookmarkFolder, Timeline, UserProfile
+from twitter_cli.output import render_success
+from twitter_cli.serialization import tweets_to_data
 
 
-def test_cli_user_command_works_with_client_factory(monkeypatch) -> None:
+def _config() -> dict:
+    return {
+        "fetch": {"count": 20},
+        "filter": {
+            "lang": [],
+            "excludeRetweets": False,
+            "minScore": None,
+            "limit": None,
+            "weights": {},
+        },
+        "rateLimit": {},
+    }
+
+
+def _install_client(monkeypatch, client) -> None:
+    monkeypatch.setattr("twitter_cli.cli._config", _config)
+    monkeypatch.setattr("twitter_cli.cli._client", lambda config, output_format: client)
+
+
+def test_help_exposes_only_the_canonical_command_vocabulary() -> None:
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0
+    command_help = result.output.split("Commands:\n", 1)[1]
+    command_names = {
+        line.split()[0]
+        for line in command_help.splitlines()
+        if line.startswith("  ") and line.strip() and not line.lstrip().startswith("-")
+    }
+    assert command_names == {
+        "article",
+        "bookmark",
+        "bookmark-folders",
+        "bookmarks",
+        "delete",
+        "feed",
+        "filter",
+        "follow",
+        "like",
+        "list",
+        "post",
+        "retweet",
+        "search",
+        "tweet",
+        "unbookmark",
+        "unfollow",
+        "unlike",
+        "unretweet",
+        "user",
+    }
+
+
+def test_feed_defaults_to_yaml_and_preserves_cursor(monkeypatch, tweet_factory) -> None:
     class FakeClient:
-        def fetch_user(self, screen_name: str) -> UserProfile:
-            return UserProfile(id="1", name="Alice", screen_name=screen_name)
+        def fetch_home_timeline(self, count, include_promoted, cursor):
+            assert (count, include_promoted, cursor) == (3, True, "cursor-1")
+            return Timeline([tweet_factory("1", is_promoted=True)], "cursor-2")
 
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    runner = CliRunner()
-    result = runner.invoke(cli, ["user", "alice"])
-    assert result.exit_code == 0
+    _install_client(monkeypatch, FakeClient())
 
-
-
-
-def test_cli_feed_json_input_path(tmp_path, tweet_factory) -> None:
-    json_path = tmp_path / "tweets.json"
-    json_path.write_text(tweets_to_json([tweet_factory("1")]), encoding="utf-8")
-
-    runner = CliRunner()
-    result = runner.invoke(cli, ["feed", "--input", str(json_path), "--json"])
-    assert result.exit_code == 0
-    assert '"id": "1"' in result.output
-
-
-def test_cli_feed_input_accepts_structured_json_envelope(tmp_path, tweet_factory) -> None:
-    json_path = tmp_path / "tweets.json"
-    json_path.write_text(
-        (
-            "{\n"
-            '  "ok": true,\n'
-            '  "schema_version": "1",\n'
-            '  "data": %s\n'
-            "}\n"
-        )
-        % tweets_to_json([tweet_factory("1")]),
-        encoding="utf-8",
+    result = CliRunner().invoke(
+        cli,
+        ["feed", "--max", "3", "--cursor", "cursor-1", "--include-promoted"],
     )
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["feed", "--input", str(json_path), "--json"])
     assert result.exit_code == 0
-    assert '"id": "1"' in result.output
-
-
-def test_cli_feed_passes_include_promoted(monkeypatch, tweet_factory) -> None:
-    class FakeClient:
-        def fetch_home_timeline(
-            self,
-            count: int,
-            include_promoted: bool = False,
-            cursor: str | None = None,
-            return_cursor: bool = False,
-        ):
-            assert count == 20
-            assert include_promoted is True
-            assert cursor is None
-            assert return_cursor is True
-            return [tweet_factory("1", is_promoted=True)], "cursor-next"
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    monkeypatch.setattr(
-        "twitter_cli.cli.load_config",
-        lambda: {"fetch": {"count": 20}, "filter": {}, "rateLimit": {}},
-    )
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["feed", "--json", "--include-promoted"])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["ok"] is True
-    assert payload["data"][0]["isPromoted"] is True
-    assert payload["pagination"]["nextCursor"] == "cursor-next"
-
-
-def test_cli_feed_accepts_cursor_and_emits_pagination(monkeypatch) -> None:
-    class FakeClient:
-        def fetch_following_feed(
-            self,
-            count: int,
-            include_promoted: bool = False,
-            cursor: str | None = None,
-            return_cursor: bool = False,
-        ):
-            assert count == 20
-            assert include_promoted is False
-            assert cursor == "cursor-prev"
-            assert return_cursor is True
-            return [], "cursor-next"
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    monkeypatch.setattr(
-        "twitter_cli.cli.load_config",
-        lambda: {"fetch": {"count": 20}, "filter": {}, "rateLimit": {}},
-    )
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["feed", "-t", "following", "--cursor", "cursor-prev", "--json"])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["ok"] is True
-    assert payload["data"] == []
-    assert payload["pagination"]["nextCursor"] == "cursor-next"
-
-
-def test_cli_list_accepts_cursor_and_emits_pagination(monkeypatch, tweet_factory) -> None:
-    class FakeClient:
-        def fetch_list_timeline(
-            self,
-            list_id: str,
-            count: int,
-            cursor: str | None = None,
-            return_cursor: bool = False,
-        ):
-            assert list_id == "123"
-            assert count == 20
-            assert cursor == "cursor-prev"
-            assert return_cursor is True
-            return [tweet_factory("1")], "cursor-next"
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    monkeypatch.setattr(
-        "twitter_cli.cli.load_config",
-        lambda: {"fetch": {"count": 20}, "filter": {}, "rateLimit": {}},
-    )
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["list", "123", "--cursor", "cursor-prev", "--json"])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["ok"] is True
+    payload = yaml.safe_load(result.output)
+    assert payload["schemaVersion"] == "1"
     assert payload["data"][0]["id"] == "1"
-    assert payload["pagination"]["nextCursor"] == "cursor-next"
+    assert payload["pagination"] == {"nextCursor": "cursor-2"}
 
 
-def test_print_tweet_table_truncates_text_by_default(tweet_factory) -> None:
-    long_text = "A" * 140
-    console = Console(record=True, width=400)
-
-    print_tweet_table([tweet_factory("1", text=long_text)], console=console)
-
-    output = console.export_text()
-    assert ("A" * 117 + "...") in output
-
-
-def test_print_tweet_table_full_text_shows_untruncated_text(tweet_factory) -> None:
-    long_text = "B" * 140
-    console = Console(record=True, width=400)
-
-    print_tweet_table([tweet_factory("1", text=long_text)], console=console, full_text=True)
-
-    output = console.export_text()
-    assert long_text in output
-    assert ("B" * 117 + "...") not in output
-
-
-@pytest.mark.parametrize(
-    "args",
-    [
-        ["favorites"],
-        ["bookmarks"],
-        ["search", "x"],
-        ["user-posts", "alice"],
-        ["likes", "alice"],
-        ["list", "123"],
-    ],
-)
-def test_cli_commands_wrap_client_creation_errors(monkeypatch, args) -> None:
-    monkeypatch.setattr(
-        "twitter_cli.cli._get_client",
-        lambda config=None, quiet=False: (_ for _ in ()).throw(RuntimeError("boom")),
-    )
-    runner = CliRunner()
-
-    result = runner.invoke(cli, args)
-
-    assert result.exit_code == 1
-    assert "boom" in result.output
-    assert type(result.exception).__name__ == "SystemExit"
-
-
-def test_cli_user_error_yaml(monkeypatch) -> None:
-    from twitter_cli.exceptions import NotFoundError
-    monkeypatch.setenv("OUTPUT", "auto")
-    monkeypatch.setattr(
-        "twitter_cli.cli._get_client",
-        lambda config=None, quiet=False: (_ for _ in ()).throw(NotFoundError("User not found")),
-    )
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["user", "alice", "--yaml"])
-
-    assert result.exit_code == 1
-    payload = yaml.safe_load(result.output)
-    assert payload["ok"] is False
-    assert payload["error"]["code"] == "not_found"
-
-
-def test_cli_tweet_accepts_shared_url_with_query(monkeypatch) -> None:
+def test_bookmarks_reads_timeline(monkeypatch, tweet_factory) -> None:
     class FakeClient:
-        def fetch_tweet_detail(self, tweet_id: str, max_count: int):
-            assert tweet_id == "12345"
-            assert max_count == 50
-            return []
+        def fetch_bookmarks(self, count):
+            assert count == 2
+            return Timeline([tweet_factory("1"), tweet_factory("2")])
 
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    monkeypatch.setattr(
-        "twitter_cli.cli.load_config",
-        lambda: {"fetch": {"count": 50}, "filter": {}, "rateLimit": {}},
-    )
-    runner = CliRunner()
+    _install_client(monkeypatch, FakeClient())
 
-    result = runner.invoke(cli, ["tweet", "https://x.com/user/status/12345?s=20"])
+    result = CliRunner().invoke(cli, ["bookmarks", "--max", "2", "--format", "json"])
 
     assert result.exit_code == 0
+    assert [tweet["id"] for tweet in yaml.safe_load(result.output)["data"]] == ["1", "2"]
 
 
-def test_cli_article_accepts_article_url_and_json(monkeypatch) -> None:
+def test_bookmark_folders_has_one_optional_resource_identifier(monkeypatch, tweet_factory) -> None:
     class FakeClient:
-        def fetch_article(self, tweet_id: str) -> Tweet:
-            assert tweet_id == "12345"
-            return Tweet(
-                id="12345",
-                text="https://t.co/article",
-                author=Author(id="u1", name="Alice", screen_name="alice"),
-                metrics=Metrics(likes=1, retweets=2, replies=3, views=4, bookmarks=5),
-                created_at="2026-03-11",
-                article_title="Title",
-                article_text="Hello\n\n## Section",
-            )
+        def fetch_bookmark_folders(self):
+            return [BookmarkFolder("f1", "Reading")]
 
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    monkeypatch.setattr(
-        "twitter_cli.cli.load_config",
-        lambda: {"fetch": {"count": 50}, "filter": {}, "rateLimit": {}},
-    )
+        def fetch_bookmark_folder_timeline(self, folder_id, count):
+            assert (folder_id, count) == ("f1", 4)
+            return Timeline([tweet_factory("4")])
+
+    _install_client(monkeypatch, FakeClient())
     runner = CliRunner()
 
-    result = runner.invoke(cli, ["article", "https://x.com/user/article/12345?s=20", "--json"])
+    folders = yaml.safe_load(runner.invoke(cli, ["bookmark-folders"]).output)
+    timeline = yaml.safe_load(runner.invoke(cli, ["bookmark-folders", "f1", "--max", "4"]).output)
 
-    assert result.exit_code == 0
-    payload = yaml.safe_load(result.output)
-    assert payload["ok"] is True
-    assert payload["data"]["id"] == "12345"
-    assert payload["data"]["articleTitle"] == "Title"
-    assert "Hello" in payload["data"]["articleText"]
+    assert folders["data"] == [{"id": "f1", "name": "Reading"}]
+    assert timeline["data"][0]["id"] == "4"
 
 
-def test_cli_article_markdown_output_and_save(monkeypatch, tmp_path) -> None:
-    article = Tweet(
-        id="12345",
-        text="https://t.co/article",
-        author=Author(id="u1", name="Alice", screen_name="alice"),
-        metrics=Metrics(likes=1, retweets=2, replies=3, views=4, bookmarks=5),
-        created_at="2026-03-11",
-        article_title="Title",
-        article_text="Hello\n\n## Section",
-    )
+def test_search_forwards_native_query_unchanged(monkeypatch, tweet_factory) -> None:
+    query = "from:alice lang:en min_faves:10"
 
     class FakeClient:
-        def fetch_article(self, tweet_id: str) -> Tweet:
-            assert tweet_id == "12345"
-            return article
+        def fetch_search(self, received_query, count, product):
+            assert (received_query, count, product) == (query, 5, "Latest")
+            return Timeline([tweet_factory("1")])
 
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    monkeypatch.setattr("twitter_cli.cli.load_config", lambda: {})
-    output_path = tmp_path / "article.md"
-    runner = CliRunner()
+    _install_client(monkeypatch, FakeClient())
 
-    result = runner.invoke(
-        cli,
-        ["article", "12345", "--markdown", "--output", str(output_path)],
-    )
+    result = CliRunner().invoke(cli, ["search", query, "--type", "Latest", "--max", "5"])
 
     assert result.exit_code == 0
-    assert result.output == article_to_markdown(article)
-    assert output_path.read_text(encoding="utf-8") == article_to_markdown(article)
+    assert yaml.safe_load(result.output)["data"][0]["id"] == "1"
 
 
-def test_cli_article_markdown_overrides_auto_structured_output(monkeypatch) -> None:
-    article = Tweet(
-        id="12345",
-        text="https://t.co/article",
-        author=Author(id="u1", name="Alice", screen_name="alice"),
-        metrics=Metrics(likes=1, retweets=2, replies=3, views=4, bookmarks=5),
-        created_at="2026-03-11",
-        article_title="Title",
-        article_text="Hello\n\n## Section",
-    )
-
+def test_user_without_username_emits_current_profile_directly(monkeypatch) -> None:
     class FakeClient:
-        def fetch_article(self, tweet_id: str) -> Tweet:
-            assert tweet_id == "12345"
-            return article
+        def fetch_me(self):
+            return UserProfile(id="42", name="Alice", username="alice")
 
-    monkeypatch.setenv("OUTPUT", "auto")
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    monkeypatch.setattr("twitter_cli.cli.load_config", lambda: {})
-    runner = CliRunner()
+    _install_client(monkeypatch, FakeClient())
 
-    result = runner.invoke(cli, ["article", "12345", "--markdown"])
+    result = CliRunner().invoke(cli, ["user"])
 
     assert result.exit_code == 0
-    assert result.output == article_to_markdown(article)
+    assert yaml.safe_load(result.output)["data"]["username"] == "alice"
+    assert "authenticated" not in result.output
 
 
-def test_cli_article_json_output_file_uses_structured_format(monkeypatch, tmp_path) -> None:
-    article = Tweet(
-        id="12345",
-        text="https://t.co/article",
-        author=Author(id="u1", name="Alice", screen_name="alice"),
-        metrics=Metrics(likes=1, retweets=2, replies=3, views=4, bookmarks=5),
-        created_at="2026-03-11",
-        article_title="Title",
-        article_text="Hello\n\n## Section",
-    )
-
+def test_user_relation_uses_one_resource_grammar(monkeypatch, tweet_factory) -> None:
     class FakeClient:
-        def fetch_article(self, tweet_id: str) -> Tweet:
-            assert tweet_id == "12345"
-            return article
+        def fetch_user(self, username):
+            assert username == "alice"
+            return UserProfile(id="42", name="Alice", username="alice")
 
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    monkeypatch.setattr("twitter_cli.cli.load_config", lambda: {})
-    output_path = tmp_path / "article.json"
-    runner = CliRunner()
+        def fetch_user_tweets(self, user_id, count):
+            assert (user_id, count) == ("42", 6)
+            return Timeline([tweet_factory("6")])
 
-    result = runner.invoke(
-        cli,
-        ["article", "12345", "--json", "--output", str(output_path)],
-    )
+    _install_client(monkeypatch, FakeClient())
+
+    result = CliRunner().invoke(cli, ["user", "@alice", "posts", "--max", "6"])
 
     assert result.exit_code == 0
-    stdout_payload = yaml.safe_load(result.output)
-    assert stdout_payload["ok"] is True
-    saved_payload = json.loads(output_path.read_text(encoding="utf-8"))
-    assert saved_payload["id"] == "12345"
-    assert saved_payload["articleTitle"] == "Title"
+    assert yaml.safe_load(result.output)["data"][0]["id"] == "6"
 
 
-def test_cli_article_rejects_compact_mode() -> None:
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["-c", "article", "12345"])
-
-    assert result.exit_code == 2
-    assert "does not support --compact" in result.output
-
-
-def test_cli_bookmark_alias_works(monkeypatch) -> None:
+def test_tweet_commands_share_url_identifier_parsing(monkeypatch, tweet_factory) -> None:
     calls = []
-
-    class FakeClient:
-        def bookmark_tweet(self, tweet_id: str) -> bool:
-            calls.append(tweet_id)
-            return True
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["bookmark", "123"])
-
-    assert result.exit_code == 0
-    assert calls == ["123"]
-
-
-def test_cli_bookmarks_folders_inherits_parent_options(monkeypatch) -> None:
-    calls = []
-
-    def fake_folder_timeline(
-        folder_id: str,
-        max_count: int | None,
-        since: str | None,
-        as_json: bool,
-        as_yaml: bool,
-        output_file: str | None,
-        do_filter: bool,
-        compact: bool,
-        full_text: bool,
-    ) -> None:
-        calls.append(
-            (
-                folder_id,
-                max_count,
-                since,
-                as_json,
-                as_yaml,
-                output_file,
-                do_filter,
-                compact,
-                full_text,
-            )
-        )
-
-    monkeypatch.setattr("twitter_cli.cli._run_bookmark_folder_timeline", fake_folder_timeline)
-    runner = CliRunner()
-
-    result = runner.invoke(
-        cli,
-        ["bookmarks", "--json", "--full-text", "-n", "7", "-o", "root.json", "--filter", "folders", "123"],
-    )
-
-    assert result.exit_code == 0
-    assert calls == [("123", 7, None, True, False, "root.json", True, False, True)]
-
-
-def test_cli_bookmarks_folders_list_inherits_parent_output_options(monkeypatch) -> None:
-    calls = []
-
-    def fake_list_bookmark_folders(
-        as_json: bool,
-        as_yaml: bool,
-        compact: bool,
-        output_file: str | None,
-    ) -> None:
-        calls.append((as_json, as_yaml, compact, output_file))
-
-    monkeypatch.setattr("twitter_cli.cli._run_list_bookmark_folders", fake_list_bookmark_folders)
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["bookmarks", "--json", "-o", "folders.json", "folders"])
-
-    assert result.exit_code == 0
-    assert calls == [(True, False, False, "folders.json")]
-
-
-def test_cli_bookmarks_folders_list_writes_output_file(monkeypatch, tmp_path) -> None:
-    class FakeClient:
-        def fetch_bookmark_folders(self) -> list[BookmarkFolder]:
-            return [BookmarkFolder(id="f1", name="Reading"), BookmarkFolder(id="f2", name="Research")]
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    monkeypatch.setattr("twitter_cli.cli.load_config", lambda: {})
-    output_path = tmp_path / "folders.json"
-    runner = CliRunner()
-
-    result = runner.invoke(
-        cli,
-        ["bookmarks", "folders", "--json", "--output", str(output_path)],
-    )
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["ok"] is True
-    assert payload["data"][0]["id"] == "f1"
-
-    saved = json.loads(output_path.read_text(encoding="utf-8"))
-    assert saved == [
-        {"id": "f1", "name": "Reading"},
-        {"id": "f2", "name": "Research"},
-    ]
-
-
-def test_cli_whoami_command(monkeypatch) -> None:
-    from twitter_cli.models import UserProfile
-
-    class FakeClient:
-        def fetch_me(self) -> UserProfile:
-            return UserProfile(id="42", name="Test User", screen_name="testuser")
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["whoami"])
-    assert result.exit_code == 0
-
-    result_json = runner.invoke(cli, ["whoami", "--json"])
-    assert result_json.exit_code == 0
-    payload = yaml.safe_load(runner.invoke(cli, ["whoami", "--yaml"]).output)
-    assert payload["ok"] is True
-    assert payload["data"]["user"]["username"] == "testuser"
-
-
-def test_cli_whoami_auto_yaml(monkeypatch) -> None:
-    class FakeClient:
-        def fetch_me(self) -> UserProfile:
-            return UserProfile(id="42", name="Test User", screen_name="testuser")
-
-    monkeypatch.setenv("OUTPUT", "auto")
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["whoami"])
-
-    assert result.exit_code == 0
-    payload = yaml.safe_load(result.output)
-    assert payload["ok"] is True
-    assert payload["schema_version"] == "1"
-    assert payload["data"]["user"]["username"] == "testuser"
-
-
-def test_cli_status_auto_yaml(monkeypatch) -> None:
-    class FakeClient:
-        def fetch_me(self) -> UserProfile:
-            return UserProfile(id="42", name="Test User", screen_name="testuser")
-
-    monkeypatch.setenv("OUTPUT", "auto")
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["status"])
-
-    assert result.exit_code == 0
-    payload = yaml.safe_load(result.output)
-    assert payload["ok"] is True
-    assert payload["schema_version"] == "1"
-    assert payload["data"]["authenticated"] is True
-    assert payload["data"]["user"]["username"] == "testuser"
-
-
-def test_cli_reply_command(monkeypatch) -> None:
-    calls = []
-
-    class FakeClient:
-        def create_tweet(self, text: str, reply_to_id=None, media_ids=None) -> str:
-            calls.append({"text": text, "reply_to_id": reply_to_id})
-            return "999"
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["reply", "12345", "Nice tweet!"])
-    assert result.exit_code == 0
-    assert calls[0]["reply_to_id"] == "12345"
-    assert calls[0]["text"] == "Nice tweet!"
-
-
-def test_cli_quote_command(monkeypatch) -> None:
-    calls = []
-
-    class FakeClient:
-        def quote_tweet(self, tweet_id: str, text: str, media_ids=None) -> str:
-            calls.append({"tweet_id": tweet_id, "text": text})
-            return "888"
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["quote", "12345", "Interesting!"])
-    assert result.exit_code == 0
-    assert calls[0]["tweet_id"] == "12345"
-    assert calls[0]["text"] == "Interesting!"
-
-
-def test_cli_post_json_output(monkeypatch) -> None:
-    class FakeClient:
-        def create_tweet(self, text: str, reply_to_id=None, media_ids=None) -> str:
-            assert text == "hello"
-            assert reply_to_id is None
-            return "999"
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["post", "hello", "--json"])
-    assert result.exit_code == 0
-    payload = yaml.safe_load(result.output)
-    assert payload["ok"] is True
-    assert payload["data"]["action"] == "post"
-    assert payload["data"]["id"] == "999"
-
-
-def test_cli_post_reply_to_accepts_status_url(monkeypatch) -> None:
-    calls = []
-
-    class FakeClient:
-        def create_tweet(self, text: str, reply_to_id=None, media_ids=None) -> str:
-            calls.append({"text": text, "reply_to_id": reply_to_id})
-            return "999"
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    runner = CliRunner()
-
-    result = runner.invoke(
-        cli,
-        ["post", "hello", "--reply-to", "https://x.com/alice/status/12345?s=20"],
-    )
-
-    assert result.exit_code == 0
-    assert calls == [{"text": "hello", "reply_to_id": "12345"}]
-
-
-def test_cli_like_yaml_output(monkeypatch) -> None:
-    class FakeClient:
-        def like_tweet(self, tweet_id: str) -> bool:
-            assert tweet_id == "123"
-            return True
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["like", "123", "--yaml"])
-    assert result.exit_code == 0
-    payload = yaml.safe_load(result.output)
-    assert payload["ok"] is True
-    assert payload["data"]["action"] == "liking_tweet"
-    assert payload["data"]["id"] == "123"
-
-
-def test_cli_follow_json_output(monkeypatch) -> None:
-    class FakeClient:
-        def resolve_user_id(self, identifier: str) -> str:
-            assert identifier == "alice"
-            return "42"
-
-        def follow_user(self, user_id: str) -> bool:
-            assert user_id == "42"
-            return True
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["follow", "alice", "--json"])
-    assert result.exit_code == 0
-    payload = yaml.safe_load(result.output)
-    assert payload["ok"] is True
-    assert payload["data"]["action"] == "follow"
-    assert payload["data"]["userId"] == "42"
-
-
-def test_cli_follow_command(monkeypatch) -> None:
-    actions = []
-
-    class FakeClient:
-        def resolve_user_id(self, identifier: str) -> str:
-            return "42"
-
-        def follow_user(self, user_id: str) -> bool:
-            actions.append(("follow", user_id))
-            return True
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["follow", "alice"])
-    assert result.exit_code == 0
-    assert actions == [("follow", "42")]
-
-
-def test_cli_unfollow_command(monkeypatch) -> None:
-    actions = []
-
-    class FakeClient:
-        def resolve_user_id(self, identifier: str) -> str:
-            return "42"
-
-        def unfollow_user(self, user_id: str) -> bool:
-            actions.append(("unfollow", user_id))
-            return True
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["unfollow", "alice"])
-    assert result.exit_code == 0
-    assert actions == [("unfollow", "42")]
-
-
-def test_cli_search_advanced_options(monkeypatch) -> None:
-    captured = {}
-
-    class FakeClient:
-        def fetch_search(self, query: str, count: int, product: str):
-            captured["query"] = query
-            captured["product"] = product
-            return []
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    monkeypatch.setattr(
-        "twitter_cli.cli.load_config",
-        lambda: {"fetch": {"count": 50}, "filter": {}, "rateLimit": {}},
-    )
-    runner = CliRunner()
-
-    result = runner.invoke(cli, [
-        "search", "python",
-        "--from", "elonmusk",
-        "--lang", "en",
-        "--since", "2026-01-01",
-        "--has", "links",
-        "--exclude", "retweets",
-        "--min-likes", "100",
-        "-t", "Latest",
-        "--json",
-    ])
-
-    assert result.exit_code == 0, f"search failed: {result.output}"
-    assert captured["query"] == (
-        "python from:elonmusk lang:en since:2026-01-01 "
-        "filter:links -filter:retweets min_faves:100"
-    )
-    assert captured["product"] == "Latest"
-
-
-def test_cli_search_operators_only_no_query(monkeypatch) -> None:
-    captured = {}
-
-    class FakeClient:
-        def fetch_search(self, query: str, count: int, product: str):
-            captured["query"] = query
-            return []
-
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    monkeypatch.setattr(
-        "twitter_cli.cli.load_config",
-        lambda: {"fetch": {"count": 50}, "filter": {}, "rateLimit": {}},
-    )
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["search", "--from", "bbc", "--json"])
-    assert result.exit_code == 0, f"search failed: {result.output}"
-    assert captured["query"] == "from:bbc"
-
-
-def test_cli_search_empty_query_no_options() -> None:
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["search"])
-    assert result.exit_code != 0
-    assert "Provide a QUERY" in result.output
-
-
-def test_cli_search_invalid_date_rejected(monkeypatch) -> None:
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: None)
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["search", "python", "--since", "not-a-date"])
-    assert result.exit_code != 0
-    assert "--since must be in YYYY-MM-DD format" in result.output
-
-
-def test_cli_search_rejects_reversed_date_range(monkeypatch) -> None:
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: None)
-    runner = CliRunner()
-
-    result = runner.invoke(cli, ["search", "python", "--since", "2026-03-02", "--until", "2026-03-01"])
-    assert result.exit_code != 0
-    assert "--since must be on or before --until" in result.output
-
-
-def test_cli_compact_mode(tmp_path, tweet_factory) -> None:
-    json_path = tmp_path / "tweets.json"
-    json_path.write_text(tweets_to_json([tweet_factory("1")]), encoding="utf-8")
-
-    runner = CliRunner()
-    result = runner.invoke(cli, ["-c", "feed", "--input", str(json_path)])
-    assert result.exit_code == 0
-    # Compact output should have "author" field with @ prefix
-    assert '"@alice"' in result.output
-    # Compact output should NOT have full metrics keys
-    assert '"metrics"' not in result.output
-
-
-def _write_cache(cache_file, tweets, created_at=None):
-    """Write a test cache file."""
-    if created_at is None:
-        created_at = time.time()
-    entries = [
-        {"index": i + 1, "id": t.id, "author": t.author.screen_name, "text": t.text[:80]}
-        for i, t in enumerate(tweets)
-    ]
-    payload = {"created_at": created_at, "tweets": entries}
-    cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-
-
-def test_show_happy_path(monkeypatch, tmp_path, tweet_factory):
-    """show <N> resolves cached index and fetches tweet detail."""
-    tw = tweet_factory("42", text="hello world")
-    cache_file = tmp_path / "last_results.json"
-    _write_cache(cache_file, [tweet_factory("10"), tw])  # tw is index 2
-
-    monkeypatch.setattr("twitter_cli.cache._CACHE_FILE", cache_file)
 
     class FakeClient:
         def fetch_tweet_detail(self, tweet_id, count):
-            assert tweet_id == "42"
-            return [tw]
+            calls.append((tweet_id, count))
+            return Timeline([tweet_factory(tweet_id)])
 
-    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
-    monkeypatch.setattr("twitter_cli.cli.load_config", lambda: {})
+    _install_client(monkeypatch, FakeClient())
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["show", "2"])
+    result = CliRunner().invoke(cli, ["tweet", "https://x.com/alice/status/123?s=20"])
+
     assert result.exit_code == 0
+    assert calls == [("123", 20)]
 
 
-def test_show_empty_cache(monkeypatch, tmp_path):
-    """show fails with a helpful message when no cache exists."""
-    cache_file = tmp_path / "last_results.json"
-    monkeypatch.setattr("twitter_cli.cache._CACHE_FILE", cache_file)
+def test_filter_reads_canonical_envelope_without_a_client(monkeypatch, tmp_path, tweet_factory) -> None:
+    input_path = tmp_path / "timeline.yaml"
+    input_path.write_text(
+        render_success(tweets_to_data([tweet_factory("1")]), "yaml"),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("twitter_cli.cli._config", _config)
+    monkeypatch.setattr(
+        "twitter_cli.cli._client",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no client")),
+    )
 
+    result = CliRunner().invoke(cli, ["filter", str(input_path)])
+
+    assert result.exit_code == 0
+    assert yaml.safe_load(result.output)["data"][0]["id"] == "1"
+
+
+def test_filter_reports_invalid_input_as_a_structured_error(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "bad.yaml"
+    path.write_text("not: a timeline", encoding="utf-8")
+    monkeypatch.setattr("twitter_cli.cli._config", _config)
+
+    result = CliRunner().invoke(cli, ["filter", str(path)])
+
+    assert result.exit_code == 1
+    payload = yaml.safe_load(result.output)
+    assert payload["error"]["code"] == "invalid_input"
+
+
+def test_article_markdown_is_an_output_format(monkeypatch, tweet_factory) -> None:
+    article = tweet_factory("88", article_title="Title", article_text="Body")
+
+    class FakeClient:
+        def fetch_article(self, tweet_id):
+            assert tweet_id == "88"
+            return article
+
+    _install_client(monkeypatch, FakeClient())
+
+    result = CliRunner().invoke(cli, ["article", "88", "--format", "markdown"])
+
+    assert result.exit_code == 0
+    assert result.output == article_to_markdown(article)
+
+
+def test_post_composes_reply_and_quote_through_one_command(monkeypatch) -> None:
+    calls = []
+
+    class FakeClient:
+        def create_tweet(self, text, reply_to_id=None, media_ids=None):
+            calls.append(("reply", text, reply_to_id, media_ids))
+            return "new-reply"
+
+        def quote_tweet(self, tweet_id, text, media_ids=None):
+            calls.append(("quote", text, tweet_id, media_ids))
+            return "new-quote"
+
+    _install_client(monkeypatch, FakeClient())
     runner = CliRunner()
-    result = runner.invoke(cli, ["show", "1"])
-    assert result.exit_code != 0
-    assert "No cached results" in result.output
+
+    reply = runner.invoke(cli, ["post", "hello", "--reply-to", "https://x.com/a/status/12"])
+    quote = runner.invoke(cli, ["post", "hello", "--quote", "13"])
+
+    assert yaml.safe_load(reply.output)["data"] == {"id": "new-reply"}
+    assert yaml.safe_load(quote.output)["data"] == {"id": "new-quote"}
+    assert calls == [
+        ("reply", "hello", "12", None),
+        ("quote", "hello", "13", None),
+    ]
 
 
-def test_show_out_of_range(monkeypatch, tmp_path, tweet_factory):
-    """show fails with out-of-range message when index exceeds cache size."""
-    cache_file = tmp_path / "last_results.json"
-    _write_cache(cache_file, [tweet_factory("1")])
-    monkeypatch.setattr("twitter_cli.cache._CACHE_FILE", cache_file)
+def test_post_rejects_two_parent_states() -> None:
+    result = CliRunner().invoke(cli, ["post", "hello", "--reply-to", "1", "--quote", "2"])
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["show", "99"])
-    assert result.exit_code != 0
-    assert "out of range" in result.output
-    assert "1" in result.output  # cache has 1 tweet
+    assert result.exit_code == 2
+    assert "Use only one" in result.output
 
 
-def test_show_expired_cache(monkeypatch, tmp_path, tweet_factory):
-    """show treats an expired cache the same as no cache."""
-    cache_file = tmp_path / "last_results.json"
-    expired_time = time.time() - 7200  # 2 hours ago
-    _write_cache(cache_file, [tweet_factory("1")], created_at=expired_time)
-    monkeypatch.setattr("twitter_cli.cache._CACHE_FILE", cache_file)
+def test_mutations_use_the_same_tweet_identifier_parser(monkeypatch) -> None:
+    calls = []
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["show", "1"])
-    assert result.exit_code != 0
-    assert "No cached results" in result.output
+    class FakeClient:
+        def like_tweet(self, tweet_id):
+            calls.append(tweet_id)
+            return True
 
+    _install_client(monkeypatch, FakeClient())
 
-def test_show_rejects_zero_index(monkeypatch, tmp_path):
-    """show rejects index=0 because indices are 1-based."""
-    cache_file = tmp_path / "last_results.json"
-    monkeypatch.setattr("twitter_cli.cache._CACHE_FILE", cache_file)
+    result = CliRunner().invoke(cli, ["like", "https://twitter.com/alice/status/123"])
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["show", "0"])
-    assert result.exit_code != 0
+    assert result.exit_code == 0
+    assert calls == ["123"]
+    assert yaml.safe_load(result.output)["data"] == {"id": "123"}
 
 
-def test_show_rejects_negative_index(monkeypatch, tmp_path):
-    """show rejects negative indices."""
-    cache_file = tmp_path / "last_results.json"
-    monkeypatch.setattr("twitter_cli.cache._CACHE_FILE", cache_file)
+def test_follow_results_contain_only_the_affected_identifier(monkeypatch) -> None:
+    class FakeClient:
+        def fetch_user(self, username):
+            assert username == "alice"
+            return UserProfile(id="42", name="Alice", username="alice")
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["show", "-1"])
-    assert result.exit_code != 0
+        def follow_user(self, user_id):
+            assert user_id == "42"
+            return True
+
+    _install_client(monkeypatch, FakeClient())
+
+    result = CliRunner().invoke(cli, ["follow", "@alice"])
+
+    assert result.exit_code == 0
+    assert yaml.safe_load(result.output)["data"] == {"id": "42"}
 
 
-def test_show_malformed_cache_treated_as_empty(monkeypatch, tmp_path):
-    """show handles a corrupted cache file gracefully."""
-    cache_file = tmp_path / "last_results.json"
-    cache_file.write_text("not valid json{{}", encoding="utf-8")
-    monkeypatch.setattr("twitter_cli.cache._CACHE_FILE", cache_file)
+def test_rich_result_uses_stdout(monkeypatch, tweet_factory) -> None:
+    class FakeClient:
+        def fetch_bookmarks(self, count):
+            return Timeline([tweet_factory("1")])
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["show", "1"])
-    assert result.exit_code != 0
-    assert "No cached results" in result.output
+    _install_client(monkeypatch, FakeClient())
+
+    result = CliRunner().invoke(cli, ["bookmarks", "--format", "rich"])
+
+    assert result.exit_code == 0
+    assert "Bookmarks" in result.stdout
+    assert "alice" in result.stdout
+
+
+def test_invalid_xdg_config_uses_the_envelope(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "twitter-cli" / "config.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text("unknown: true\n", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+    result = CliRunner().invoke(cli, ["bookmarks"])
+
+    assert result.exit_code == 1
+    assert yaml.safe_load(result.output)["error"]["code"] == "invalid_input"

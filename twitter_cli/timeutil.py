@@ -69,14 +69,3 @@ def format_relative_time(created_at: str) -> str:
         return "%dmo ago" % months
     years = days // 365
     return "%dy ago" % years
-
-
-def format_iso8601(created_at: str) -> str:
-    """Convert Twitter timestamp to ISO 8601 format.
-
-    Returns e.g. "2026-03-08T12:00:00+00:00" or the original string on failure.
-    """
-    dt = _parse_twitter_time(created_at)
-    if dt is None:
-        return created_at
-    return dt.isoformat()

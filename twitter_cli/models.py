@@ -1,19 +1,16 @@
-"""Data models for twitter-cli.
-
-Defines Tweet, Author, Metrics, and TweetMedia as simple dataclasses.
-"""
+"""Canonical runtime models for twitter-cli."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Literal, Optional
 
 
 @dataclass
 class Author:
     id: str
     name: str
-    screen_name: str
+    username: str
     profile_image_url: str = ""
     verified: bool = False
 
@@ -30,7 +27,7 @@ class Metrics:
 
 @dataclass
 class TweetMedia:
-    type: str  # "photo" | "video" | "animated_gif"
+    type: Literal["photo", "video", "animated_gif"]
     url: str
     width: Optional[int] = None
     height: Optional[int] = None
@@ -43,8 +40,8 @@ class Tweet:
     author: Author
     metrics: Metrics
     created_at: str
-    media: List[TweetMedia] = field(default_factory=list)
-    urls: List[str] = field(default_factory=list)
+    media: list[TweetMedia] = field(default_factory=list)
+    urls: list[str] = field(default_factory=list)
     is_retweet: bool = False
     lang: str = ""
     retweeted_by: Optional[str] = None
@@ -57,6 +54,12 @@ class Tweet:
 
 
 @dataclass
+class Timeline:
+    tweets: list[Tweet]
+    next_cursor: Optional[str] = None
+
+
+@dataclass
 class BookmarkFolder:
     id: str
     name: str
@@ -66,14 +69,14 @@ class BookmarkFolder:
 class UserProfile:
     id: str
     name: str
-    screen_name: str
+    username: str
     bio: str = ""
     location: str = ""
     url: str = ""
-    followers_count: int = 0
-    following_count: int = 0
-    tweets_count: int = 0
-    likes_count: int = 0
+    followers: int = 0
+    following: int = 0
+    tweets: int = 0
+    likes: int = 0
     verified: bool = False
     profile_image_url: str = ""
     created_at: str = ""

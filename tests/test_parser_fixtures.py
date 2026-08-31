@@ -11,7 +11,6 @@ def _make_client() -> TwitterClient:
     client._request_delay = 0.0
     client._max_retries = 0
     client._retry_base_delay = 0.0
-    client._max_count = 200
     return client
 
 
@@ -105,5 +104,5 @@ def test_fetch_user_list_with_fixture(monkeypatch, fixture_loader) -> None:
     )
 
     assert len(users) == 1
-    assert users[0].screen_name == "follower1"
+    assert users[0].username == "follower1"
     assert users[0].verified is True

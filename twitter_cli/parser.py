@@ -97,7 +97,7 @@ def _extract_author(user_data, user_legacy):
     return Author(
         id=user_data.get("rest_id", ""),
         name=user_core.get("name") or user_legacy.get("name") or user_data.get("name", "Unknown"),
-        screen_name=(
+        username=(
             user_core.get("screen_name")
             or user_legacy.get("screen_name")
             or user_data.get("screen_name", "unknown")
@@ -390,14 +390,14 @@ def parse_user_result(user_data):
     return UserProfile(
         id=user_data.get("rest_id", ""),
         name=core.get("name") or legacy.get("name", ""),
-        screen_name=core.get("screen_name") or legacy.get("screen_name", ""),
+        username=core.get("screen_name") or legacy.get("screen_name", ""),
         bio=legacy.get("description", ""),
         location=location_obj.get("location") or legacy.get("location", ""),
         url=_deep_get(legacy, "entities", "url", "urls", 0, "expanded_url") or "",
-        followers_count=_parse_int(legacy.get("followers_count"), 0),
-        following_count=_parse_int(legacy.get("friends_count"), 0),
-        tweets_count=_parse_int(legacy.get("statuses_count"), 0),
-        likes_count=_parse_int(legacy.get("favourites_count"), 0),
+        followers=_parse_int(legacy.get("followers_count"), 0),
+        following=_parse_int(legacy.get("friends_count"), 0),
+        tweets=_parse_int(legacy.get("statuses_count"), 0),
+        likes=_parse_int(legacy.get("favourites_count"), 0),
         verified=user_data.get("is_blue_verified", False) or legacy.get("verified", False),
         profile_image_url=avatar.get("image_url") or legacy.get("profile_image_url_https", ""),
         created_at=core.get("created_at") or legacy.get("created_at", ""),

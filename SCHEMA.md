@@ -1,57 +1,98 @@
-# Structured Output Schema
+# Structured output schema
 
-`twitter-cli` uses a shared agent-friendly envelope for machine-readable output.
+YAML is the default. `--format json` emits the same data model as JSON.
 
-## Success
+## Envelope
 
 ```yaml
 ok: true
-schema_version: "1"
+schemaVersion: "1"
 data: ...
 pagination:
-  nextCursor: "optional-cursor"
+  nextCursor: optional
 ```
-
-## Error
 
 ```yaml
 ok: false
-schema_version: "1"
+schemaVersion: "1"
 error:
   code: api_error
-  message: User @foo not found
+  message: ...
+  details: optional
 ```
 
-## Notes
+`pagination` appears only when an endpoint returns a continuation cursor.
 
-- `--yaml` and `--json` both use this envelope
-- non-TTY stdout defaults to YAML
-- tweet and user lists are returned under `data`
-- timeline-style list commands may also return `pagination.nextCursor`
-- `article` returns a single tweet object under `data`
-- `status` returns `data.authenticated` plus `data.user`
-- `whoami` returns `data.user`
-- write commands also support explicit `--json` / `--yaml`
-
-## Article Fields
-
-`twitter article <id> --json` returns the standard tweet object plus:
+## Tweet
 
 ```yaml
-data:
-  id: "1234567890"
-  articleTitle: "Article Title"
-  articleText: |
-    # Heading
-    Body text...
+id: "123"
+text: Post body
+author:
+  id: "42"
+  name: Alice
+  username: alice
+  profileImageUrl: https://example.invalid/image
+  verified: false
+metrics:
+  likes: 0
+  retweets: 0
+  replies: 0
+  quotes: 0
+  views: 0
+  bookmarks: 0
+createdAt: Sat Mar 08 12:00:00 +0000 2026
+media: []
+urls: []
+isRetweet: false
+retweetedBy: null
+lang: en
+isSubscriberOnly: false
+isPromoted: false
 ```
 
-## Error Codes
+Filtered tweets may add `score`. Quoted tweets add `quotedTweet` using this same Tweet shape
+recursively. Article tweets may add `articleTitle` and `articleText`.
+Media `type` is one of `photo`, `video`, or `animated_gif`.
 
-Common structured error codes:
+## User
+
+```yaml
+id: "42"
+name: Alice
+username: alice
+bio: ...
+location: ...
+url: ...
+followers: 0
+following: 0
+tweets: 0
+likes: 0
+verified: false
+profileImageUrl: https://example.invalid/image
+createdAt: Sat Mar 08 12:00:00 +0000 2026
+```
+
+## Bookmark folder
+
+```yaml
+id: folder-id
+name: Reading
+```
+
+## Write result
+
+```yaml
+id: affected-resource-id
+```
+
+## Error codes
 
 - `not_authenticated`
 - `not_found`
 - `invalid_input`
 - `rate_limited`
+- `network_error`
+- `query_id_error`
+- `media_upload_error`
 - `api_error`

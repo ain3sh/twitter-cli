@@ -1,150 +1,165 @@
-"""Shared structured output helpers for twitter-cli."""
+"""Canonical structured output for twitter-cli."""
 
 from __future__ import annotations
 
 import json
-import os
 import sys
-from typing import Any, Callable
+from typing import Any, Callable, Literal, cast
 
 import click
 import yaml
 
-_OUTPUT_ENV = "OUTPUT"
+OutputFormat = Literal["yaml", "json", "rich", "markdown"]
+
 _SCHEMA_VERSION = "1"
+_STRUCTURED_FORMATS = ("yaml", "json")
+_OUTPUT_FORMATS = (*_STRUCTURED_FORMATS, "rich")
+
+
+class _YamlDumper(yaml.SafeDumper):
+    def ignore_aliases(self, data: Any) -> bool:
+        return True
+
+
+def _represent_string(dumper: yaml.SafeDumper, value: str) -> yaml.Node:
+    style = "|" if "\n" in value else None
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+
+
+_YamlDumper.add_representer(str, _represent_string)
 
 
 def ensure_utf8_streams() -> None:
-    """Reconfigure stdout/stderr to use UTF-8 encoding on Windows.
-
-    On Windows with ConPTY disabled (e.g. winpty fallback + PowerShell),
-    the default encoding may be GBK/cp936 which cannot encode emoji.
-    Calling reconfigure(encoding='utf-8') once at startup fixes ALL
-    output paths — click.echo, rich Console, and plain print — without
-    needing per-call wrappers.
-
-    This is a no-op on Unix (already UTF-8) and safe to call multiple times.
-    """
+    """Use UTF-8 for captured Windows output."""
     if sys.platform != "win32":
         return
     for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8")
-            except Exception:
-                pass  # frozen or non-standard stream, skip
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
 
 
-def default_structured_format(*, as_json: bool, as_yaml: bool) -> str | None:
-    """Resolve explicit flags first, then env override, then TTY default."""
-    if as_json and as_yaml:
-        raise click.UsageError("Use only one of --json or --yaml.")
-    if as_yaml:
-        return "yaml"
-    if as_json:
-        return "json"
-
-    output_mode = os.getenv(_OUTPUT_ENV, "auto").strip().lower()
-    if output_mode == "yaml":
-        return "yaml"
-    if output_mode == "json":
-        return "json"
-    if output_mode == "rich":
-        return None
-
-    if not sys.stdout.isatty():
-        return "yaml"
-    return None
+def resolve_output_format(output_format: str | None) -> OutputFormat:
+    """Resolve the command's output format, defaulting to YAML."""
+    return cast(OutputFormat, output_format or "yaml")
 
 
-def use_rich_output(*, as_json: bool, as_yaml: bool, compact: bool = False) -> bool:
-    """Return True when human-readable rich output should be used."""
-    if compact:
-        return False
-    return default_structured_format(as_json=as_json, as_yaml=as_yaml) is None
+def output_option(command: Callable | None = None, *, markdown: bool = False) -> Callable:
+    """Add the shared output-format option to a Click command."""
+    formats = (*_OUTPUT_FORMATS, "markdown") if markdown else _OUTPUT_FORMATS
+
+    def decorate(target: Callable) -> Callable:
+        return click.option(
+            "--format",
+            "output_format",
+            type=click.Choice(formats),
+            default=None,
+            help="Output format (default: yaml).",
+        )(target)
+
+    return decorate(command) if command is not None else decorate
 
 
-def structured_output_options(command: Callable) -> Callable:
-    """Add --json/--yaml options to a Click command."""
-    command = click.option("--yaml", "as_yaml", is_flag=True, help="Output as YAML.")(command)
-    command = click.option("--json", "as_json", is_flag=True, help="Output as JSON.")(command)
-    return command
+def use_rich_output(output_format: str | None) -> bool:
+    """Return whether human-readable Rich output is active."""
+    return resolve_output_format(output_format) == "rich"
 
 
-def emit_structured(data: Any, *, as_json: bool, as_yaml: bool) -> bool:
-    """Emit structured output and return True when used."""
-    fmt = default_structured_format(as_json=as_json, as_yaml=as_yaml)
-    if not fmt:
-        return False
-    payload = _normalize_success_payload(data)
-    if fmt == "json":
-        click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
-    else:
-        click.echo(
-            yaml.safe_dump(
-                payload,
-                allow_unicode=True,
-                sort_keys=False,
-                default_flow_style=False,
-            )
-        )
-    return True
+def use_structured_output(output_format: str | None) -> bool:
+    """Return whether the output uses the canonical serialized envelope."""
+    return resolve_output_format(output_format) in _STRUCTURED_FORMATS
 
 
-def success_payload(data: Any) -> dict[str, Any]:
-    """Wrap structured success data in the shared agent schema."""
-    return {
+def success_payload(
+    data: Any,
+    *,
+    pagination: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Wrap successful data in the stable structured envelope."""
+    payload = {
         "ok": True,
-        "schema_version": _SCHEMA_VERSION,
+        "schemaVersion": _SCHEMA_VERSION,
         "data": data,
     }
+    if pagination is not None:
+        payload["pagination"] = pagination
+    return payload
 
 
 def error_payload(code: str, message: str, *, details: Any | None = None) -> dict[str, Any]:
-    """Wrap structured error data in the shared agent schema."""
-    error = {
-        "code": code,
-        "message": message,
-    }
+    """Wrap an error in the stable structured envelope."""
+    error: dict[str, Any] = {"code": code, "message": message}
     if details is not None:
         error["details"] = details
     return {
         "ok": False,
-        "schema_version": _SCHEMA_VERSION,
+        "schemaVersion": _SCHEMA_VERSION,
         "error": error,
     }
 
 
-def _normalize_success_payload(data: Any) -> Any:
-    """Wrap plain structured data in the shared agent success schema."""
-    if isinstance(data, dict) and data.get("schema_version") == _SCHEMA_VERSION and "ok" in data:
-        return data
-    return success_payload(data)
+def _render_payload(payload: dict[str, Any], output_format: str | None) -> str:
+    """Serialize one canonical envelope."""
+    fmt = resolve_output_format(output_format)
+    if fmt not in _STRUCTURED_FORMATS:
+        raise ValueError(f"{fmt} output is not a structured envelope")
+    if fmt == "json":
+        return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    return yaml.dump(
+        payload,
+        Dumper=_YamlDumper,
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=False,
+        width=10_000,
+    )
+
+
+def render_success(
+    data: Any,
+    output_format: str | None,
+    *,
+    pagination: dict[str, Any] | None = None,
+) -> str:
+    """Serialize one successful envelope."""
+    return _render_payload(
+        success_payload(data, pagination=pagination),
+        output_format,
+    )
+
+
+def emit_success(
+    data: Any,
+    output_format: str | None,
+    *,
+    pagination: dict[str, Any] | None = None,
+) -> bool:
+    """Emit a success envelope, or return False when Rich output is active."""
+    if not use_structured_output(output_format):
+        return False
+    click.echo(
+        render_success(data, output_format, pagination=pagination),
+        nl=False,
+    )
+    return True
 
 
 def emit_error(
     code: str,
     message: str,
     *,
-    as_json: bool | None = None,
-    as_yaml: bool | None = None,
+    output_format: str | None = None,
     details: Any | None = None,
 ) -> bool:
-    """Emit a structured error when the active output mode is machine-readable."""
-    if as_json is None or as_yaml is None:
+    """Emit an error using the active command format."""
+    if output_format is None:
         ctx = click.get_current_context(silent=True)
-        params = ctx.params if ctx is not None else {}
-        as_json = bool(params.get("as_json", False)) if as_json is None else as_json
-        as_yaml = bool(params.get("as_yaml", False)) if as_yaml is None else as_yaml
-
-    fmt = default_structured_format(as_json=bool(as_json), as_yaml=bool(as_yaml))
-    if fmt is None:
+        if ctx is not None:
+            output_format = ctx.params.get("output_format")
+    if not use_structured_output(output_format):
         return False
-
-    payload = error_payload(code, message, details=details)
-    if fmt == "json":
-        click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
-    else:
-        click.echo(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False, default_flow_style=False))
+    click.echo(
+        _render_payload(error_payload(code, message, details=details), output_format),
+        nl=False,
+    )
     return True
-

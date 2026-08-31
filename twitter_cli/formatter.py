@@ -1,14 +1,12 @@
-"""Tweet formatter for terminal output (rich) and JSON export."""
+"""Rich terminal formatting for tweets and users."""
 
 from __future__ import annotations
 
 import sys
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
-from rich.console import Console
-from rich.markdown import Markdown
-from rich.panel import Panel
-from rich.table import Table
+if TYPE_CHECKING:
+    from rich.console import Console
 
 from .models import Tweet, UserProfile
 from .timeutil import format_local_time, format_relative_time
@@ -21,6 +19,8 @@ def _make_console() -> Console:
     to stdout, making output invisible to pipe/subprocess capture.
     Using force_terminal=False in non-TTY contexts prevents this.
     """
+    from rich.console import Console
+
     if sys.platform == "win32" and not sys.stdout.isatty():
         return Console(force_terminal=False)
     return Console()
@@ -39,11 +39,11 @@ def print_tweet_table(
     tweets: List[Tweet],
     console: Optional[Console] = None,
     title: Optional[str] = None,
-    full_text: bool = False,
 ) -> None:
     """Print tweets as a rich table."""
     if console is None:
         console = _make_console()
+    from rich.table import Table
 
     if not title:
         title = "📱 Twitter — %d tweets" % len(tweets)
@@ -51,22 +51,19 @@ def print_tweet_table(
     table = Table(title=title, show_lines=True, expand=True)
     table.add_column("#", style="dim", width=3, justify="right")
     table.add_column("Author", style="cyan", width=18, no_wrap=True)
-    table.add_column("Tweet", ratio=3)
+    table.add_column("Tweet", ratio=3, overflow="fold")
     table.add_column("Stats", style="green", width=22, no_wrap=True)
     table.add_column("Score", style="yellow", width=6, justify="right")
 
     for i, tweet in enumerate(tweets):
         # Author
         verified = " ✓" if tweet.author.verified else ""
-        author_text = "@%s%s" % (tweet.author.screen_name, verified)
+        author_text = "@%s%s" % (tweet.author.username, verified)
         if tweet.is_retweet and tweet.retweeted_by:
             author_text += "\n🔄 @%s" % tweet.retweeted_by
 
         # Tweet text
         text = tweet.text.replace("\n", " ").strip()
-        if not full_text and len(text) > 120:
-            text = text[:117] + "..."
-
         # Media indicators
         if tweet.media:
             media_icons = []
@@ -83,12 +80,10 @@ def print_tweet_table(
         if tweet.quoted_tweet:
             qt = tweet.quoted_tweet
             qt_text = qt.text.replace("\n", " ")
-            if not full_text and len(qt_text) > 60:
-                qt_text = qt_text[:57] + "..."
-            text += "\n┌ @%s: %s" % (qt.author.screen_name, qt_text)
+            text += "\n┌ @%s: %s" % (qt.author.username, qt_text)
 
         # Tweet link
-        text += "\n🔗 x.com/%s/status/%s" % (tweet.author.screen_name, tweet.id)
+        text += "\n🔗 x.com/%s/status/%s" % (tweet.author.username, tweet.id)
 
         # Stats
         rel_time = format_relative_time(tweet.created_at)
@@ -115,9 +110,10 @@ def print_tweet_detail(tweet: Tweet, console: Optional[Console] = None) -> None:
     """Print a single tweet in detail using a rich panel."""
     if console is None:
         console = _make_console()
+    from rich.panel import Panel
 
     verified = " ✓" if tweet.author.verified else ""
-    header = "@%s%s (%s)" % (tweet.author.screen_name, verified, tweet.author.name)
+    header = "@%s%s (%s)" % (tweet.author.username, verified, tweet.author.name)
 
     body_parts = []
 
@@ -140,7 +136,7 @@ def print_tweet_detail(tweet: Tweet, console: Optional[Console] = None) -> None:
     if tweet.quoted_tweet:
         qt = tweet.quoted_tweet
         body_parts.append("")
-        body_parts.append("┌── Quoted @%s ──" % qt.author.screen_name)
+        body_parts.append("┌── Quoted @%s ──" % qt.author.username)
         body_parts.append(qt.text)
 
     body_parts.append("")
@@ -158,7 +154,7 @@ def print_tweet_detail(tweet: Tweet, console: Optional[Console] = None) -> None:
     rel_time = format_relative_time(tweet.created_at)
     body_parts.append(
         "🕐 %s (%s) · https://x.com/%s/status/%s"
-        % (local_time, rel_time, tweet.author.screen_name, tweet.id)
+        % (local_time, rel_time, tweet.author.username, tweet.id)
     )
 
     console.print(Panel(
@@ -175,9 +171,9 @@ def article_to_markdown(tweet: Tweet) -> str:
     lines = [
         "# %s" % title,
         "",
-        "- Author: @%s (%s)" % (tweet.author.screen_name, tweet.author.name),
+        "- Author: @%s (%s)" % (tweet.author.username, tweet.author.name),
         "- Published: %s" % (tweet.created_at or "unknown"),
-        "- URL: https://x.com/%s/status/%s" % (tweet.author.screen_name, tweet.id),
+        "- URL: https://x.com/%s/status/%s" % (tweet.author.username, tweet.id),
         "- Likes: %s" % format_number(tweet.metrics.likes),
         "- Retweets: %s" % format_number(tweet.metrics.retweets),
         "- Replies: %s" % format_number(tweet.metrics.replies),
@@ -195,13 +191,15 @@ def print_article(tweet: Tweet, console: Optional[Console] = None) -> None:
     """Print a Twitter Article with rich formatting."""
     if console is None:
         console = _make_console()
+    from rich.markdown import Markdown
+    from rich.panel import Panel
 
     verified = " ✓" if tweet.author.verified else ""
     title = tweet.article_title or "Twitter Article"
     meta_parts = [
-        "By @%s%s (%s)" % (tweet.author.screen_name, verified, tweet.author.name),
+        "By @%s%s (%s)" % (tweet.author.username, verified, tweet.author.name),
         "🕐 %s" % tweet.created_at,
-        "🔗 x.com/%s/status/%s" % (tweet.author.screen_name, tweet.id),
+        "🔗 x.com/%s/status/%s" % (tweet.author.username, tweet.id),
         "",
         "❤️ %s  🔄 %s  💬 %s  🔖 %s  👁️ %s"
         % (
@@ -224,33 +222,14 @@ def print_article(tweet: Tweet, console: Optional[Console] = None) -> None:
         console.print(Markdown(tweet.article_text))
 
 
-def print_filter_stats(
-    original_count: int,
-    filtered: List[Tweet],
-    console: Optional[Console] = None,
-) -> None:
-    """Print filter statistics."""
-    if console is None:
-        console = _make_console()
-
-    console.print(
-        "📊 Filter: %d → %d tweets" % (original_count, len(filtered))
-    )
-    if filtered:
-        top_score = filtered[0].score or 0.0
-        bottom_score = filtered[-1].score or 0.0
-        console.print(
-            "   Score range: %.1f ~ %.1f" % (bottom_score, top_score)
-        )
-
-
 def print_user_profile(user: UserProfile, console: Optional[Console] = None) -> None:
     """Print user profile as a rich panel."""
     if console is None:
         console = _make_console()
+    from rich.panel import Panel
 
     verified = " ✓" if user.verified else ""
-    header = "@%s%s (%s)" % (user.screen_name, verified, user.name)
+    header = "@%s%s (%s)" % (user.username, verified, user.name)
 
     lines = []
     if user.bio:
@@ -267,16 +246,16 @@ def print_user_profile(user: UserProfile, console: Optional[Console] = None) -> 
     lines.append(
         "👥 %s followers · %s following · %s tweets · %s likes"
         % (
-            format_number(user.followers_count),
-            format_number(user.following_count),
-            format_number(user.tweets_count),
-            format_number(user.likes_count),
+            format_number(user.followers),
+            format_number(user.following),
+            format_number(user.tweets),
+            format_number(user.likes),
         )
     )
 
     if user.created_at:
         lines.append("📅 Joined %s" % user.created_at)
-    lines.append("🔗 x.com/%s" % user.screen_name)
+    lines.append("🔗 x.com/%s" % user.username)
 
     console.print(Panel(
         "\n".join(lines),
@@ -294,6 +273,7 @@ def print_user_table(
     """Print a list of users as a rich table."""
     if console is None:
         console = _make_console()
+    from rich.table import Table
 
     if not title:
         title = "👥 Users — %d" % len(users)
@@ -306,7 +286,7 @@ def print_user_table(
 
     for i, user in enumerate(users):
         verified = " ✓" if user.verified else ""
-        user_text = "@%s%s\n%s" % (user.screen_name, verified, user.name)
+        user_text = "@%s%s\n%s" % (user.username, verified, user.name)
 
         bio = (user.bio or "").replace("\n", " ").strip()
         if len(bio) > 100:
@@ -315,8 +295,8 @@ def print_user_table(
         stats = (
             "👥 %s followers\n📝 %s following"
             % (
-                format_number(user.followers_count),
-                format_number(user.following_count),
+                format_number(user.followers),
+                format_number(user.following),
             )
         )
 

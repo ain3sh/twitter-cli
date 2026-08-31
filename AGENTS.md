@@ -1,70 +1,72 @@
-# AGENTS.md — Agent Developer Guide for twitter-cli
+<coding_guidelines>
+# AGENTS.md - twitter-cli developer guide
 
-This file provides context for AI agents working in this repository.
+## Project
 
-## Project Overview
+- Python 3.10+
+- Click CLI
+- uv package manager
+- Repository: https://github.com/ain3sh/twitter-cli
+- Upstream: https://github.com/public-clis/twitter-cli
 
-- **Project**: twitter-cli — A CLI for Twitter/X (read timelines, bookmarks, search, post, reply, etc.)
-- **Language**: Python 3.10+
-- **Package Manager**: uv (recommended) / pip
-- **Repository**: https://github.com/jackwener/twitter-cli
-
-## Build, Lint, and Test Commands
+## Checks
 
 ```bash
-# Install all dependencies (including dev)
 uv sync --extra dev
-
-# Run ruff linter
 uv run ruff check .
-
-# Run mypy type checker
 uv run mypy twitter_cli
-
-# Run all tests (excludes smoke tests by default)
 uv run pytest -q
-
-# Run a single test
-uv run pytest tests/test_cli.py::test_feed_command -v
-
-# Run tests matching pattern
-uv run pytest -k "test_parse" -v
+uv run pytest -m smoke -v
 ```
 
-## Code Style
+## Style
 
-- **Line length**: 100 characters
-- **Python version**: 3.10+
-- Use `from __future__ import annotations` at top of all .py files
-- **Functions/variables**: `snake_case`, **Classes**: `PascalCase`, **Constants**: `UPPER_SNAKE_CASE`
-- Private functions: prefix with `_`
-- Use `@dataclass` for data models (in `models.py`)
-- Use Click framework for CLI commands
-- Custom exceptions in `exceptions.py`, base: `TwitterError(RuntimeError)`
+- Line length: 100
+- Add `from __future__ import annotations` to Python modules.
+- Use snake_case for Python names and PascalCase for classes.
+- Dataclasses live in `models.py`.
+- Custom exceptions derive from `TwitterError` in `exceptions.py`.
 
-## Project Structure
+## Canonical runtime contracts
 
-```
+- YAML is the default; commands expose one `--format` selector.
+- Structured output uses the envelope in `SCHEMA.md` with `schemaVersion: "1"`.
+- Rich results go to stdout; progress and diagnostics go to stderr.
+- Save output with shell redirection. Do not add an output-file option.
+- `Timeline` is the only internal tweet-list result and owns `next_cursor`.
+- Nested quoted tweets use the full recursive Tweet shape.
+- The model and public contract use `username`; `screen_name` exists only as an upstream API key.
+- `user [username] [relation]` owns profiles and user relations.
+- `post` owns posts, replies, and quotes.
+- `filter` owns local timeline transformation and never creates a client.
+- Search accepts Twitter's native query grammar; do not add operator flags or a query builder.
+- All tweet-targeting commands accept the same numeric ID or x.com/twitter.com URL grammar.
+- Write results contain only the affected `id`.
+- Browser discovery is owned by `auth.py`; do not add subprocess or filesystem shims.
+- Read paths must not initialize write-only transaction-ID machinery.
+- Config lives under XDG config; caches live under XDG cache.
+- Config parsing is strict and uses only the shape documented in README.md.
+- Keep `twitter_cli.__version__` and `project.version` synchronized.
+
+## Modules
+
+```text
 twitter_cli/
-├── cli.py               # Click CLI entry point
-├── client.py            # Twitter API client (HTTP)
-├── auth.py              # Cookie extraction & auth
-├── graphql.py           # GraphQL query IDs
-├── parser.py            # Tweet/User parsing
-├── models.py            # Dataclass models
-├── formatter.py         # Rich table formatting
-├── serialization.py     # YAML/JSON output
-├── output.py            # Structured output helpers
-├── config.py            # Config loading
-├── filter.py            # Tweet ranking/scoring
-├── constants.py         # Constants
-├── exceptions.py        # Custom exceptions
-├── cache.py             # Tweet caching
-├── search.py            # Search utilities
-└── timeutil.py          # Time utilities
+  main.py           process entrypoint and fast version path
+  cli.py            canonical Click command graph
+  client.py         Twitter HTTP client
+  auth.py           browser cookie discovery
+  parser.py         upstream response parsing
+  models.py         dataclass models
+  serialization.py canonical wire conversion
+  output.py         envelopes and output selection
+  formatter.py      Rich terminal rendering
+  config.py         strict XDG configuration
+  filter.py         tweet scoring and filtering
+  graphql.py        query IDs and feature flags
+  constants.py      browser request constants
+  exceptions.py     error hierarchy
+  paths.py          XDG paths
+  timeutil.py       terminal time formatting
 ```
-
-## CI
-
-- GitHub Actions: Python 3.10, 3.11, 3.12
-- CI validates: ruff check + mypy + pytest
+</coding_guidelines>
