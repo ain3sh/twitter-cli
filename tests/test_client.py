@@ -7,19 +7,20 @@ and feature flag update logic — all without requiring network access.
 from __future__ import annotations
 
 import copy
+import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 from twitter_cli.client import (
-    _best_chrome_target,
     TwitterClient,
+    _best_chrome_target,
 )
 from twitter_cli.exceptions import TwitterAPIError
 from twitter_cli.graphql import (
-    FEATURES,
     FALLBACK_QUERY_IDS,
+    FEATURES,
     _build_graphql_url,
     _update_features_from_html,
 )
@@ -35,7 +36,6 @@ from twitter_cli.parser import (
     parse_tweet_result,
     parse_user_result,
 )
-
 
 # ── _deep_get ────────────────────────────────────────────────────────────
 
@@ -221,10 +221,21 @@ class TestBestChromeTarget:
 
     def test_fallback_when_no_browser_type(self):
         with patch.dict("sys.modules", {"curl_cffi.requests": MagicMock(BrowserType=MagicMock(side_effect=TypeError))}):
-            # Force re-evaluation by clearing cached result
-            # When BrowserType iteration fails, should still return a fallback
-            target = _best_chrome_target()
-            assert isinstance(target, str)
+            assert _best_chrome_target() == "chrome131"
+
+    def test_selects_newest_desktop_target(self):
+        browser_types = [
+            SimpleNamespace(value="chrome133a"),
+            SimpleNamespace(value="chrome136"),
+            SimpleNamespace(value="chrome150"),
+            SimpleNamespace(value="chrome131_android"),
+        ]
+
+        with patch.dict(
+            sys.modules,
+            {"curl_cffi.requests": SimpleNamespace(BrowserType=browser_types)},
+        ):
+            assert _best_chrome_target() == "chrome150"
 
 
 # ── _update_features_from_html ───────────────────────────────────────────
@@ -266,12 +277,7 @@ class TestUpdateFeaturesFromHtml:
 # ── TwitterClient._build_headers ─────────────────────────────────────────
 
 class TestBuildHeaders:
-    @patch("twitter_cli.client._get_cffi_session")
-    @patch("twitter_cli.client._gen_ct_headers", return_value={})
-    def test_required_headers_present(self, mock_ct_headers, mock_session):
-        mock_session.return_value = MagicMock()
-        mock_session.return_value.get = MagicMock(side_effect=Exception("skip init"))
-
+    def test_required_headers_present(self):
         client = TwitterClient.__new__(TwitterClient)
         client._auth_token = "test_token"
         client._ct0 = "test_ct0"
@@ -279,7 +285,6 @@ class TestBuildHeaders:
         client._request_delay = 2.5
         client._max_retries = 3
         client._retry_base_delay = 5.0
-        client._max_count = 200
         client._client_transaction = None
         client._ct_init_attempted = True
 
@@ -297,21 +302,14 @@ class TestBuildHeaders:
     @patch("twitter_cli.client.get_sec_ch_ua_arch", return_value='"x86"')
     @patch("twitter_cli.client.get_accept_language", return_value="zh-CN,zh;q=0.9,en;q=0.8")
     @patch("twitter_cli.client.get_twitter_client_language", return_value="zh")
-    @patch("twitter_cli.client._get_cffi_session")
-    @patch("twitter_cli.client._gen_ct_headers", return_value={})
     def test_cookie_string_used_when_available(
         self,
-        mock_ct_headers,
-        mock_session,
-        mock_client_language,
-        mock_accept_language,
-        mock_arch,
-        mock_platform_version,
-        mock_platform,
+        _mock_client_language,
+        _mock_accept_language,
+        _mock_arch,
+        _mock_platform_version,
+        _mock_platform,
     ):
-        mock_session.return_value = MagicMock()
-        mock_session.return_value.get = MagicMock(side_effect=Exception("skip"))
-
         client = TwitterClient.__new__(TwitterClient)
         client._auth_token = "token"
         client._ct0 = "ct0"
@@ -319,7 +317,6 @@ class TestBuildHeaders:
         client._request_delay = 2.5
         client._max_retries = 3
         client._retry_base_delay = 5.0
-        client._max_count = 200
         client._client_transaction = None
         client._ct_init_attempted = True
 
@@ -331,12 +328,21 @@ class TestBuildHeaders:
         assert headers["sec-ch-ua-arch"] == '"x86"'
         assert headers["sec-ch-ua-platform-version"] == '""'
 
+    def test_transaction_initialization_is_write_only(self):
+        client = TwitterClient("token", "csrf")
+        client._ensure_client_transaction = MagicMock()
+
+        client._build_headers("https://x.com/i/api/graphql/query/Read", "GET")
+        client._ensure_client_transaction.assert_not_called()
+
+        client._build_headers("https://x.com/i/api/graphql/query/Write", "POST")
+        client._ensure_client_transaction.assert_called_once_with()
+
 
 class TestPaginationBehavior:
     def test_fetch_timeline_can_include_promoted_content(self):
         client = TwitterClient.__new__(TwitterClient)
         client._request_delay = 0.0
-        client._max_count = 200
 
         calls = []
 
@@ -354,7 +360,6 @@ class TestPaginationBehavior:
     def test_continues_when_cursor_advances_without_new_tweets(self):
         client = TwitterClient.__new__(TwitterClient)
         client._request_delay = 0.0
-        client._max_count = 200
 
         responses = iter(
             [
@@ -374,14 +379,13 @@ class TestPaginationBehavior:
         client._graphql_get = _graphql_get
 
         with patch('twitter_cli.client.parse_timeline_response', side_effect=_parse_timeline_response):
-            tweets = client._fetch_timeline("HomeTimeline", 1, lambda data: data)
+            timeline = client._fetch_timeline("HomeTimeline", 1, lambda data: data)
 
-        assert [tweet.id for tweet in tweets] == ["tweet-1"]
+        assert [tweet.id for tweet in timeline.tweets] == ["tweet-1"]
 
     def test_stops_when_cursor_does_not_advance(self):
         client = TwitterClient.__new__(TwitterClient)
         client._request_delay = 0.0
-        client._max_count = 200
 
         calls = []
 
@@ -392,15 +396,15 @@ class TestPaginationBehavior:
         client._graphql_get = _graphql_get
 
         with patch('twitter_cli.client.parse_timeline_response', return_value=([], "cursor-same")):
-            tweets = client._fetch_timeline("HomeTimeline", 1, lambda data: data)
+            timeline = client._fetch_timeline("HomeTimeline", 1, lambda data: data)
 
-        assert tweets == []
+        assert timeline.tweets == []
+        assert timeline.next_cursor is None
         assert calls == [None, "cursor-same"]
 
     def test_fetch_timeline_returns_continuation_cursor(self):
         client = TwitterClient.__new__(TwitterClient)
         client._request_delay = 0.0
-        client._max_count = 200
 
         calls = []
 
@@ -412,22 +416,20 @@ class TestPaginationBehavior:
 
         tweet = MagicMock(id="tweet-1")
         with patch('twitter_cli.client.parse_timeline_response', return_value=([tweet], "cursor-next")):
-            tweets, cursor = client._fetch_timeline(
+            timeline = client._fetch_timeline(
                 "HomeTimeline",
                 1,
                 lambda data: data,
                 start_cursor="cursor-prev",
-                return_cursor=True,
             )
 
-        assert [item.id for item in tweets] == ["tweet-1"]
-        assert cursor == "cursor-next"
+        assert [item.id for item in timeline.tweets] == ["tweet-1"]
+        assert timeline.next_cursor == "cursor-next"
         assert calls[0]["cursor"] == "cursor-prev"
 
     def test_fetch_list_timeline_accepts_cursor_and_returns_cursor(self):
         client = TwitterClient.__new__(TwitterClient)
         client._request_delay = 0.0
-        client._max_count = 200
 
         calls = []
 
@@ -439,15 +441,14 @@ class TestPaginationBehavior:
 
         tweet = MagicMock(id="tweet-1")
         with patch('twitter_cli.client.parse_timeline_response', return_value=([tweet], "cursor-next")):
-            tweets, cursor = client.fetch_list_timeline(
+            timeline = client.fetch_list_timeline(
                 "list-1",
                 1,
                 cursor="cursor-prev",
-                return_cursor=True,
             )
 
-        assert [item.id for item in tweets] == ["tweet-1"]
-        assert cursor == "cursor-next"
+        assert [item.id for item in timeline.tweets] == ["tweet-1"]
+        assert timeline.next_cursor == "cursor-next"
         assert calls[0][0] == "ListLatestTweetsTimeline"
         assert calls[0][1]["listId"] == "list-1"
         assert calls[0][1]["cursor"] == "cursor-prev"
@@ -455,7 +456,6 @@ class TestPaginationBehavior:
     def test_user_list_continues_when_cursor_advances_without_new_users(self):
         client = TwitterClient.__new__(TwitterClient)
         client._request_delay = 0.0
-        client._max_count = 200
 
         responses = iter(
             [
@@ -468,7 +468,7 @@ class TestPaginationBehavior:
             return next(responses)
 
         def _parse_user_result(data):
-            return MagicMock(id=data["id"], screen_name=data["screen_name"])
+            return MagicMock(id=data["id"], username=data["screen_name"])
 
         def _get_instructions(data):
             if data["page"] == 1:
@@ -493,7 +493,7 @@ class TestPaginationBehavior:
         with patch('twitter_cli.client.parse_user_result', side_effect=_parse_user_result):
             users = client._fetch_user_list("Followers", "1", 1, _get_instructions)
 
-        assert [user.screen_name for user in users] == ["alice"]
+        assert [user.username for user in users] == ["alice"]
 
 
 # ── Article parsing helpers ───────────────────────────────────────────────
@@ -878,8 +878,7 @@ class TestParseTweetResult:
     }
 
     @patch("twitter_cli.client._get_cffi_session")
-    @patch("twitter_cli.client._gen_ct_headers", return_value={})
-    def test_parses_basic_tweet(self, mock_ct_headers, mock_session):
+    def test_parses_basic_tweet(self, mock_session):
         mock_session.return_value = MagicMock()
         mock_session.return_value.get = MagicMock(side_effect=Exception("skip"))
 
@@ -891,7 +890,7 @@ class TestParseTweetResult:
         assert tweet is not None
         assert tweet.id == "1234567890"
         assert tweet.text == "Hello world! This is a test tweet."
-        assert tweet.author.screen_name == "testuser"
+        assert tweet.author.username == "testuser"
         assert tweet.author.verified is True  # is_blue_verified
         assert tweet.metrics.likes == 100
         assert tweet.metrics.views == 5000
@@ -899,8 +898,7 @@ class TestParseTweetResult:
         assert tweet.is_retweet is False
 
     @patch("twitter_cli.client._get_cffi_session")
-    @patch("twitter_cli.client._gen_ct_headers", return_value={})
-    def test_parses_tombstone_returns_none(self, mock_ct_headers, mock_session):
+    def test_parses_tombstone_returns_none(self, mock_session):
         mock_session.return_value = MagicMock()
         mock_session.return_value.get = MagicMock(side_effect=Exception("skip"))
 
@@ -912,8 +910,7 @@ class TestParseTweetResult:
         assert parse_tweet_result(result) is None
 
     @patch("twitter_cli.client._get_cffi_session")
-    @patch("twitter_cli.client._gen_ct_headers", return_value={})
-    def test_parses_visibility_wrapper(self, mock_ct_headers, mock_session):
+    def test_parses_visibility_wrapper(self, mock_session):
         mock_session.return_value = MagicMock()
         mock_session.return_value.get = MagicMock(side_effect=Exception("skip"))
 
@@ -931,8 +928,7 @@ class TestParseTweetResult:
         assert tweet.is_subscriber_only is False
 
     @patch("twitter_cli.client._get_cffi_session")
-    @patch("twitter_cli.client._gen_ct_headers", return_value={})
-    def test_parses_outer_visibility_wrapper_for_retweet(self, mock_ct_headers, mock_session):
+    def test_parses_outer_visibility_wrapper_for_retweet(self, mock_session):
         mock_session.return_value = MagicMock()
         mock_session.return_value.get = MagicMock(side_effect=Exception("skip"))
 
@@ -998,8 +994,7 @@ class TestParseTweetResult:
         assert tweet.is_subscriber_only is True
 
     @patch("twitter_cli.client._get_cffi_session")
-    @patch("twitter_cli.client._gen_ct_headers", return_value={})
-    def test_depth_limit(self, mock_ct_headers, mock_session):
+    def test_depth_limit(self, mock_session):
         mock_session.return_value = MagicMock()
         mock_session.return_value.get = MagicMock(side_effect=Exception("skip"))
 
@@ -1010,8 +1005,7 @@ class TestParseTweetResult:
         assert parse_tweet_result(self.SAMPLE_TWEET_RESULT, depth=3) is None
 
     @patch("twitter_cli.client._get_cffi_session")
-    @patch("twitter_cli.client._gen_ct_headers", return_value={})
-    def test_article_atomic_image_block_renders_markdown_image(self, mock_ct_headers, mock_session):
+    def test_article_atomic_image_block_renders_markdown_image(self, mock_session):
         mock_session.return_value = MagicMock()
         mock_session.return_value.get = MagicMock(side_effect=Exception("skip"))
 
@@ -1051,8 +1045,7 @@ class TestParseTweetResult:
         assert tweet.article_text == "Intro\n\n![A cat](https://pbs.twimg.com/media/cat.jpg)\n\nOutro"
 
     @patch("twitter_cli.client._get_cffi_session")
-    @patch("twitter_cli.client._gen_ct_headers", return_value={})
-    def test_article_atomic_image_block_supports_list_entity_map_and_media_entities(self, mock_ct_headers, mock_session):
+    def test_article_atomic_image_block_supports_list_entity_map_and_media_entities(self, mock_session):
         mock_session.return_value = MagicMock()
         mock_session.return_value.get = MagicMock(side_effect=Exception("skip"))
 
@@ -1092,8 +1085,7 @@ class TestParseTweetResult:
         assert tweet.article_text == "Intro\n\n![](https://pbs.twimg.com/media/example.png)\n\nOutro"
 
     @patch("twitter_cli.client._get_cffi_session")
-    @patch("twitter_cli.client._gen_ct_headers", return_value={})
-    def test_article_real_shape_odysseus_like_payload_renders_two_images(self, mock_ct_headers, mock_session):
+    def test_article_real_shape_odysseus_like_payload_renders_two_images(self, mock_session):
         mock_session.return_value = MagicMock()
         mock_session.return_value.get = MagicMock(side_effect=Exception("skip"))
 
@@ -1148,8 +1140,7 @@ class TestParseTweetResult:
         )
 
     @patch("twitter_cli.client._get_cffi_session")
-    @patch("twitter_cli.client._gen_ct_headers", return_value={})
-    def test_article_real_shape_elvissun_like_payload_renders_caption_and_three_images(self, mock_ct_headers, mock_session):
+    def test_article_real_shape_elvissun_like_payload_renders_caption_and_three_images(self, mock_session):
         mock_session.return_value = MagicMock()
         mock_session.return_value.get = MagicMock(side_effect=Exception("skip"))
 
@@ -1253,10 +1244,10 @@ class TestParseUserResult:
         )
 
         assert user is not None
-        assert user.followers_count == 1234
-        assert user.following_count == 56
-        assert user.tweets_count == 78
-        assert user.likes_count == 0
+        assert user.followers == 1234
+        assert user.following == 56
+        assert user.tweets == 78
+        assert user.likes == 0
 
     def test_reads_core_avatar_location_when_legacy_absent(self):
         """New API shape: name/screen_name/created_at moved to core{},
@@ -1279,7 +1270,7 @@ class TestParseUserResult:
         assert user is not None
         assert user.id == "user-2"
         assert user.name == "Bob"
-        assert user.screen_name == "bob"
+        assert user.username == "bob"
         assert user.created_at == "Tue Mar 21 17:25:43 +0000 2023"
         assert user.profile_image_url == "https://example.com/bob.jpg"
         assert user.location == "Earth"
@@ -1303,7 +1294,7 @@ class TestParseUserResult:
 
         assert user is not None
         assert user.name == "NewName"
-        assert user.screen_name == "new_handle"
+        assert user.username == "new_handle"
         assert user.profile_image_url == "https://example.com/new.jpg"
         # bio still comes from legacy — it hasn't migrated
         assert user.bio == "old bio"
@@ -1325,7 +1316,7 @@ class TestParseUserResult:
 
         assert user is not None
         assert user.name == "Carol"
-        assert user.screen_name == "carol"
+        assert user.username == "carol"
         assert user.profile_image_url == "https://example.com/carol.jpg"
         assert user.location == "Mars"
         assert user.created_at == "Mon Jan 01 00:00:00 +0000 2020"
@@ -1355,7 +1346,6 @@ class TestUploadMedia:
         client._request_delay = 0
         client._max_retries = 3
         client._retry_base_delay = 5.0
-        client._max_count = 200
         client._client_transaction = None
         client._ct_init_attempted = True
         return client
@@ -1433,7 +1423,6 @@ class TestCreateTweetWithMedia:
         client._request_delay = 0
         client._max_retries = 0
         client._retry_base_delay = 0
-        client._max_count = 200
         client._client_transaction = None
         client._ct_init_attempted = True
 
@@ -1465,7 +1454,6 @@ class TestCreateTweetWithMedia:
         client._request_delay = 0
         client._max_retries = 0
         client._retry_base_delay = 0
-        client._max_count = 200
         client._client_transaction = None
         client._ct_init_attempted = True
 
@@ -1495,7 +1483,6 @@ class TestFetchSearchUsesPost:
         client._request_delay = 0
         client._max_retries = 0
         client._retry_base_delay = 0
-        client._max_count = 200
         client._client_transaction = None
         client._ct_init_attempted = True
         return client
@@ -1526,7 +1513,8 @@ class TestFetchSearchUsesPost:
         assert op_name == "SearchTimeline"
         assert variables["rawQuery"] == "AI agent"
         assert variables["product"] == "Top"
-        assert results == []
+        assert results.tweets == []
+        assert results.next_cursor is None
 
     def test_fetch_search_passes_product_param(self):
         """fetch_search forwards the product parameter correctly."""
@@ -1539,7 +1527,7 @@ class TestFetchSearchUsesPost:
             return {"data": {"search_by_raw_query": {"search_timeline": {"timeline": {"instructions": []}}}}}
 
         client._graphql_post = mock_post
-        client._graphql_get = lambda *a, **kw: {}  # pragma: no cover
+        client._graphql_get = lambda *_args, **_kwargs: {}
 
         client.fetch_search("python", count=3, product="Latest")
 

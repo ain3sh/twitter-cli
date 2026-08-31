@@ -1,16 +1,11 @@
-"""Tweet filtering and engagement scoring.
-
-Scores tweets by a weighted engagement formula and filters by
-configurable rules (topN, min score, language, etc.).
-"""
+"""Tweet filtering and engagement scoring."""
 
 from __future__ import annotations
 
-from dataclasses import replace
 import math
+from dataclasses import replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from .config import _as_float, _as_int
 from .models import Tweet
 
 DEFAULT_WEIGHTS = {
@@ -18,7 +13,7 @@ DEFAULT_WEIGHTS = {
     "retweets": 3.0,
     "replies": 2.0,
     "bookmarks": 5.0,
-    "views_log": 0.5,
+    "viewsLog": 0.5,
 }
 
 
@@ -30,7 +25,7 @@ def score_tweet(tweet: Tweet, weights: Optional[Dict[str, float]] = None) -> flo
             + w_retweets × retweets
             + w_replies × replies
             + w_bookmarks × bookmarks
-            + w_views_log × log10(views)
+            + the configured viewsLog weight × log10(views)
 
     Args:
         weights: Pre-built weight dict. If None, uses DEFAULT_WEIGHTS.
@@ -42,7 +37,7 @@ def score_tweet(tweet: Tweet, weights: Optional[Dict[str, float]] = None) -> flo
         + w.get("retweets", 3.0) * m.retweets
         + w.get("replies", 2.0) * m.replies
         + w.get("bookmarks", 5.0) * m.bookmarks
-        + w.get("views_log", 0.5) * math.log10(max(m.views, 1))
+        + w.get("viewsLog", 0.5) * math.log10(max(m.views, 1))
     )
 
 
@@ -50,11 +45,10 @@ def filter_tweets(tweets: Sequence[Tweet], config: Mapping[str, Any]) -> List[Tw
     """Filter and rank tweets according to config.
 
     Config keys:
-      mode: "topN" | "score" | "all"
-      topN: int
-      minScore: float
       lang: list[str]  (empty = no filter)
       excludeRetweets: bool
+      minScore: optional float
+      limit: optional int
       weights: dict
     """
     filtered = list(tweets)
@@ -76,20 +70,17 @@ def filter_tweets(tweets: Sequence[Tweet], config: Mapping[str, Any]) -> List[Tw
     # 4. Sort by score (descending)
     scored.sort(key=lambda tweet: tweet.score or 0.0, reverse=True)
 
-    # 5. Apply filter mode
-    mode = str(config.get("mode", "topN"))
-    if mode == "topN":
-        top_n = max(_as_int(config.get("topN"), 20), 1)
-        return scored[:top_n]
-    if mode == "score":
-        min_score = _as_float(config.get("minScore"), 50.0)
-        return [tweet for tweet in scored if (tweet.score or 0.0) >= min_score]
-    return scored
+    min_score = config.get("minScore")
+    if min_score is not None:
+        scored = [tweet for tweet in scored if (tweet.score or 0.0) >= min_score]
+
+    limit = config.get("limit")
+    return scored[:limit] if limit is not None else scored
 
 
 def _build_weights(raw_weights: Mapping[str, Any]) -> Dict[str, float]:
-    """Merge custom weights with defaults and coerce to float."""
+    """Merge canonical custom weights with defaults."""
     merged = {}
     for key, default_value in DEFAULT_WEIGHTS.items():
-        merged[key] = _as_float(raw_weights.get(key), default_value)
+        merged[key] = raw_weights.get(key, default_value)
     return merged

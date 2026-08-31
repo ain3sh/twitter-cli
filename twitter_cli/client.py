@@ -9,14 +9,10 @@ import math
 import mimetypes
 import os
 import random
+import re
 import time
 import urllib.parse
 from typing import TYPE_CHECKING, Any, Callable, cast
-
-import bs4
-from curl_cffi import requests as _cffi_requests
-from x_client_transaction import ClientTransaction
-from x_client_transaction.utils import generate_headers as _gen_ct_headers, get_ondemand_file_url
 
 from .constants import (
     BEARER_TOKEN,
@@ -24,8 +20,8 @@ from .constants import (
     SEC_CH_UA_MOBILE,
     SEC_CH_UA_MODEL,
     get_accept_language,
-    get_sec_ch_ua_arch,
     get_sec_ch_ua,
+    get_sec_ch_ua_arch,
     get_sec_ch_ua_full_version,
     get_sec_ch_ua_full_version_list,
     get_sec_ch_ua_platform,
@@ -47,7 +43,7 @@ from .graphql import (
     _resolve_query_id,
     _update_features_from_html,
 )
-from .models import BookmarkFolder, UserProfile
+from .models import BookmarkFolder, Timeline, UserProfile
 from .parser import (
     _deep_get,
     _parse_int,
@@ -55,6 +51,7 @@ from .parser import (
     parse_tweet_result,
     parse_user_result,
 )
+from .paths import cache_dir
 
 if TYPE_CHECKING:
     from typing import Dict, List, Optional, Set, Tuple  # noqa: F401
@@ -64,43 +61,36 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Shared curl_cffi session (single-threaded CLI)
-_cffi_session = None
+_cffi_session: Any = None
 
 TimelineInstructionGetter = Callable[[Any], Any]
-
-# Hard ceiling to prevent accidental massive fetches
-_ABSOLUTE_MAX_COUNT = 500
-
 
 # ── Session management ───────────────────────────────────────────────────
 
 
 def _best_chrome_target():
     # type: () -> str
-    """Detect the best available Chrome impersonation target at runtime.
-
-    curl_cffi versions differ in which Chrome targets they ship.
-    e.g. 0.14.0 has chrome133a but not chrome133.
-    """
+    """Select the newest desktop Chrome impersonation target."""
     try:
         from curl_cffi.requests import BrowserType
-        available = {e.value for e in BrowserType}
-    except ImportError:
+        available = {item.value for item in BrowserType}
+    except (ImportError, TypeError):
         # curl_cffi not installed or BrowserType not available
-        logger.debug("curl_cffi.BrowserType not available, using fallback targets")
+        logger.debug("curl_cffi.BrowserType not available, using fallback target")
         available = set()
 
-    # Preference order: exact chrome versions, then suffixed variants
-    for target in ("chrome133", "chrome133a", "chrome136", "chrome131", "chrome130"):
-        if target in available:
-            return target
-    # Fallback: pick highest chrome* with a pure numeric suffix
-    chrome_targets = sorted(
-        [v for v in available if v.startswith("chrome") and v.replace("chrome", "").isdigit()],
-        key=lambda x: int(x.replace("chrome", "")),
-        reverse=True,
-    )
-    return chrome_targets[0] if chrome_targets else "chrome131"
+    candidates = []
+    for target in available:
+        match = re.fullmatch(r"chrome(\d+)([a-z]?)", target)
+        if match:
+            candidates.append(
+                (
+                    int(match.group(1)),
+                    not bool(match.group(2)),
+                    target,
+                )
+            )
+    return max(candidates)[2] if candidates else "chrome131"
 
 
 def _get_cffi_session():
@@ -108,10 +98,12 @@ def _get_cffi_session():
     """Return shared curl_cffi session with Chrome impersonation and optional proxy."""
     global _cffi_session
     if _cffi_session is None:
+        from curl_cffi import requests as cffi_requests
+
         proxy = os.environ.get("TWITTER_PROXY", "")
         target = _best_chrome_target()
         sync_chrome_version(target)  # align UA/sec-ch-ua with impersonate target
-        _cffi_session = _cffi_requests.Session(
+        _cffi_session = cffi_requests.Session(
             impersonate=cast(Any, target),
             proxies={"https": proxy, "http": proxy} if proxy else None,
         )
@@ -145,16 +137,13 @@ class TwitterClient:
         self._request_delay = float(rl.get("requestDelay", 2.5))
         self._max_retries = int(rl.get("maxRetries", 3))
         self._retry_base_delay = float(rl.get("retryBaseDelay", 5.0))
-        self._max_count = min(int(rl.get("maxCount", 200)), _ABSOLUTE_MAX_COUNT)
         self._client_transaction = None  # type: Optional[Any]
         self._ct_init_attempted = False
-        # Eagerly initialize ClientTransaction on construction
-        self._ensure_client_transaction()
 
     # ── Read operations ──────────────────────────────────────────────
 
-    def fetch_home_timeline(self, count=20, include_promoted=False, cursor=None, return_cursor=False):
-        # type: (int, bool, Optional[str], bool) -> Any
+    def fetch_home_timeline(self, count=20, include_promoted=False, cursor=None):
+        # type: (int, bool, Optional[str]) -> Timeline
         """Fetch home timeline tweets."""
         return self._fetch_timeline(
             "HomeTimeline",
@@ -162,11 +151,10 @@ class TwitterClient:
             lambda data: _deep_get(data, "data", "home", "home_timeline_urt", "instructions"),
             include_promoted=include_promoted,
             start_cursor=cursor,
-            return_cursor=return_cursor,
         )
 
-    def fetch_following_feed(self, count=20, include_promoted=False, cursor=None, return_cursor=False):
-        # type: (int, bool, Optional[str], bool) -> Any
+    def fetch_following_feed(self, count=20, include_promoted=False, cursor=None):
+        # type: (int, bool, Optional[str]) -> Timeline
         """Fetch chronological following feed."""
         return self._fetch_timeline(
             "HomeLatestTimeline",
@@ -174,11 +162,10 @@ class TwitterClient:
             lambda data: _deep_get(data, "data", "home", "home_timeline_urt", "instructions"),
             include_promoted=include_promoted,
             start_cursor=cursor,
-            return_cursor=return_cursor,
         )
 
     def fetch_bookmarks(self, count=50):
-        # type: (int) -> List[Tweet]
+        # type: (int) -> Timeline
         """Fetch bookmarked tweets."""
         def get_instructions(data):
             # type: (Any) -> Any
@@ -223,7 +210,7 @@ class TwitterClient:
         return folders
 
     def fetch_bookmark_folder_timeline(self, folder_id, count=50):
-        # type: (str, int) -> List[Tweet]
+        # type: (str, int) -> Timeline
         """Fetch tweets from a bookmark folder."""
         def get_instructions(data):
             # type: (Any) -> Any
@@ -242,22 +229,11 @@ class TwitterClient:
             override_base_variables=True,
         )
 
-    def resolve_user_id(self, identifier):
-        # type: (str) -> str
-        """Resolve a user identifier (screen_name or numeric user_id) to numeric user_id.
-
-        If identifier is all digits, returns it as-is. Otherwise fetches the user profile.
-        """
-        if identifier.isdigit():
-            return identifier
-        profile = self.fetch_user(identifier)
-        return profile.id
-
-    def fetch_user(self, screen_name):
+    def fetch_user(self, username):
         # type: (str) -> UserProfile
-        """Fetch user profile by screen name."""
+        """Fetch a user profile by username."""
         variables = {
-            "screen_name": screen_name,
+            "screen_name": username,
             "withSafetyModeUserFields": True,
         }
         features = {
@@ -277,7 +253,7 @@ class TwitterClient:
         data = self._graphql_get("UserByScreenName", variables, features)
         result = _deep_get(data, "data", "user", "result")
         if not result:
-            raise NotFoundError("User @%s not found" % screen_name)
+            raise NotFoundError("User @%s not found" % username)
 
         legacy = result.get("legacy", {})
         core = result.get("core", {})
@@ -286,21 +262,21 @@ class TwitterClient:
         return UserProfile(
             id=result.get("rest_id", ""),
             name=core.get("name") or legacy.get("name", ""),
-            screen_name=core.get("screen_name") or legacy.get("screen_name", screen_name),
+            username=core.get("screen_name") or legacy.get("screen_name", username),
             bio=legacy.get("description", ""),
             location=location_obj.get("location") or legacy.get("location", ""),
             url=_deep_get(legacy, "entities", "url", "urls", 0, "expanded_url") or "",
-            followers_count=_parse_int(legacy.get("followers_count"), 0),
-            following_count=_parse_int(legacy.get("friends_count"), 0),
-            tweets_count=_parse_int(legacy.get("statuses_count"), 0),
-            likes_count=_parse_int(legacy.get("favourites_count"), 0),
+            followers=_parse_int(legacy.get("followers_count"), 0),
+            following=_parse_int(legacy.get("friends_count"), 0),
+            tweets=_parse_int(legacy.get("statuses_count"), 0),
+            likes=_parse_int(legacy.get("favourites_count"), 0),
             verified=bool(result.get("is_blue_verified") or legacy.get("verified", False)),
             profile_image_url=avatar.get("image_url") or legacy.get("profile_image_url_https", ""),
             created_at=core.get("created_at") or legacy.get("created_at", ""),
         )
 
     def fetch_user_tweets(self, user_id, count=20):
-        # type: (str, int) -> List[Tweet]
+        # type: (str, int) -> Timeline
         """Fetch tweets posted by a user."""
         return self._fetch_timeline(
             "UserTweets",
@@ -319,7 +295,7 @@ class TwitterClient:
         )
 
     def fetch_user_likes(self, user_id, count=20):
-        # type: (str, int) -> List[Tweet]
+        # type: (str, int) -> Timeline
         """Fetch tweets liked by a user."""
 
         def get_likes_instructions(data):
@@ -346,13 +322,13 @@ class TwitterClient:
         )
 
     def fetch_search(self, query, count=20, product="Top"):
-        # type: (str, int, str) -> List[Tweet]
+        # type: (str, int, str) -> Timeline
         """Search tweets by query.
 
         Args:
             query: Search query string.
             count: Max number of tweets to return.
-            product: Search tab — "Top", "Latest", "People", "Photos", "Videos".
+            product: Search tab — "Top", "Latest", "Photos", "Videos".
         """
         # Twitter migrated SearchTimeline from GET to POST — use _graphql_post.
         return self._fetch_timeline(
@@ -371,7 +347,7 @@ class TwitterClient:
         )
 
     def fetch_tweet_detail(self, tweet_id, count=20):
-        # type: (str, int) -> List[Tweet]
+        # type: (str, int) -> Timeline
         """Fetch a tweet and its conversation thread (replies)."""
         return self._fetch_timeline(
             "TweetDetail",
@@ -437,8 +413,8 @@ class TwitterClient:
         logger.info("fetch_article: tweet_id=%s", tweet_id)
         return tweet
 
-    def fetch_list_timeline(self, list_id, count=20, cursor=None, return_cursor=False):
-        # type: (str, int, Optional[str], bool) -> Any
+    def fetch_list_timeline(self, list_id, count=20, cursor=None):
+        # type: (str, int, Optional[str]) -> Timeline
         """Fetch tweets from a Twitter List."""
         return self._fetch_timeline(
             "ListLatestTweetsTimeline",
@@ -447,7 +423,6 @@ class TwitterClient:
             extra_variables={"listId": list_id},
             override_base_variables=True,
             start_cursor=cursor,
-            return_cursor=return_cursor,
         )
 
     def fetch_followers(self, user_id, count=20):
@@ -520,8 +495,8 @@ class TwitterClient:
             raise MediaUploadError("INIT failed (HTTP %d): %s" % (resp.status_code, resp.text[:300]))
         try:
             init_result = json.loads(resp.text)
-        except (json.JSONDecodeError, ValueError):
-            raise MediaUploadError("INIT returned invalid JSON")
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise MediaUploadError("INIT returned invalid JSON") from exc
         media_id = init_result.get("media_id_string", "")
         if not media_id:
             raise MediaUploadError("INIT did not return media_id")
@@ -647,20 +622,20 @@ class TwitterClient:
         - Old: list of dicts with nested "user" objects (rich fields)
         - New: {"users": [...]} with minimal fields (user_id, name, screen_name)
 
-        When the response only has minimal fields, we use the screen_name to
+        When the response only has minimal fields, we use the username to
         fetch the full profile via the GraphQL UserByScreenName endpoint.
         """
         url = "https://x.com/i/api/1.1/account/multi/list.json"
         data = self._api_get(url)
 
-        screen_name = None
+        username = None
 
         # New format: {"users": [{"user_id": ..., "screen_name": ..., ...}]}
         if isinstance(data, dict) and "users" in data:
             users = data["users"]
             if isinstance(users, list) and users:
                 user_data = users[0]
-                screen_name = user_data.get("screen_name")
+                username = user_data.get("screen_name")
 
         # Old format: [{"user": {"id_str": ..., ...}}]
         elif isinstance(data, list) and data:
@@ -672,24 +647,24 @@ class TwitterClient:
                     return UserProfile(
                         id=str(user_data.get("id_str", "")),
                         name=user_data.get("name", ""),
-                        screen_name=sn,
+                        username=sn,
                         bio=user_data.get("description", ""),
                         location=user_data.get("location", ""),
                         url=_deep_get(user_data, "entities", "url", "urls", 0, "expanded_url") or "",
-                        followers_count=_parse_int(user_data.get("followers_count"), 0),
-                        following_count=_parse_int(user_data.get("friends_count"), 0),
-                        tweets_count=_parse_int(user_data.get("statuses_count"), 0),
-                        likes_count=_parse_int(user_data.get("favourites_count"), 0),
+                        followers=_parse_int(user_data.get("followers_count"), 0),
+                        following=_parse_int(user_data.get("friends_count"), 0),
+                        tweets=_parse_int(user_data.get("statuses_count"), 0),
+                        likes=_parse_int(user_data.get("favourites_count"), 0),
                         verified=bool(user_data.get("verified", False)),
                         profile_image_url=user_data.get("profile_image_url_https", ""),
                         created_at=user_data.get("created_at", ""),
                     )
-                screen_name = sn
+                username = sn
 
-        # Use screen_name to fetch full profile via GraphQL
-        if screen_name:
-            logger.info("Fetching full profile for @%s via GraphQL", screen_name)
-            return self.fetch_user(screen_name)
+        # Use the username to fetch the full profile via GraphQL
+        if username:
+            logger.info("Fetching full profile for @%s via GraphQL", username)
+            return self.fetch_user(username)
 
         raise TwitterAPIError(0, "Failed to fetch current user info")
 
@@ -749,8 +724,8 @@ class TwitterClient:
 
     # ── Internal: timeline / user list fetchers ──────────────────────
 
-    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False, include_promoted=False, start_cursor=None, return_cursor=False):
-        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool, bool, Optional[str], bool) -> Any
+    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False, include_promoted=False, start_cursor=None):
+        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool, bool, Optional[str]) -> Timeline
         """Generic timeline fetcher with pagination and deduplication.
 
         Args:
@@ -761,10 +736,7 @@ class TwitterClient:
                 endpoints like SearchTimeline that Twitter migrated to POST.
         """
         if count <= 0:
-            return []
-
-        # Enforce max count cap
-        count = min(count, self._max_count)
+            return Timeline([])
 
         tweets = []  # type: List[Tweet]
         seen_ids = set()  # type: Set[str]
@@ -820,16 +792,13 @@ class TwitterClient:
                 logger.debug("Sleeping %.1fs between requests", jitter)
                 time.sleep(jitter)
 
-        if return_cursor:
-            return tweets[:count], continuation_cursor
-        return tweets[:count]
+        return Timeline(tweets[:count], continuation_cursor)
 
     def _fetch_user_list(self, operation_name, user_id, count, get_instructions, use_post=False):
         # type: (str, str, int, Callable[[Any], Any], bool) -> List[UserProfile]
         """Generic user list fetcher (for followers/following) with pagination."""
         if count <= 0:
             return []
-        count = min(count, self._max_count)
         users = []  # type: List[UserProfile]
         seen_ids = set()  # type: Set[str]
         cursor = None  # type: Optional[str]
@@ -983,12 +952,12 @@ class TwitterClient:
             except TwitterAPIError:
                 raise
             except Exception as exc:
-                raise TwitterAPIError(0, "Twitter API network error: %s" % exc)
+                raise TwitterAPIError(0, "Twitter API network error: %s" % exc) from exc
 
             try:
                 parsed = json.loads(payload)
-            except (json.JSONDecodeError, ValueError):
-                raise TwitterAPIError(0, "Twitter API returned invalid JSON")
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise TwitterAPIError(0, "Twitter API returned invalid JSON") from exc
 
             if isinstance(parsed, dict) and parsed.get("errors"):
                 err_msg = parsed["errors"][0].get("message", "Unknown error")
@@ -1015,7 +984,7 @@ class TwitterClient:
             if isinstance(parsed, dict) and "data" in parsed:
                 data_obj = parsed["data"]
                 if isinstance(data_obj, dict):
-                    for key, val in data_obj.items():
+                    for val in data_obj.values():
                         if isinstance(val, dict) and val.get("errors"):
                             inner_errors = val["errors"]
                             if inner_errors:
@@ -1033,13 +1002,15 @@ class TwitterClient:
     def _ct_cache_path():
         # type: () -> str
         """Return path for transaction cache file."""
-        home = os.path.expanduser("~")
-        return os.path.join(home, ".twitter-cli", "transaction_cache.json")
+        return str(cache_dir() / "transaction_cache.json")
 
     def _load_ct_cache(self):
         # type: () -> bool
         """Try to load ClientTransaction from cache.  Returns True on success."""
         try:
+            from bs4 import BeautifulSoup
+            from x_client_transaction import ClientTransaction
+
             cache_path = self._ct_cache_path()
             if not os.path.exists(cache_path):
                 return False
@@ -1052,7 +1023,7 @@ class TwitterClient:
             ondemand_text = cache.get("ondemand_text", "")
             if not home_html or not ondemand_text:
                 return False
-            home_page_response = bs4.BeautifulSoup(home_html, "html.parser")
+            home_page_response = BeautifulSoup(home_html, "html.parser")
             self._client_transaction = ClientTransaction(
                 home_page_response=home_page_response,
                 ondemand_file_response=ondemand_text,
@@ -1098,15 +1069,22 @@ class TwitterClient:
             return
 
         try:
+            from bs4 import BeautifulSoup
+            from x_client_transaction import ClientTransaction
+            from x_client_transaction.utils import (
+                generate_headers,
+                get_ondemand_file_url,
+            )
+
             # Use curl_cffi for ClientTransaction init to maintain consistent
             # Chrome TLS fingerprint. Using Python requests here would leak
             # a different TLS fingerprint on the same IP — a detection vector.
             cffi_session = _get_cffi_session()
-            ct_headers = _gen_ct_headers()
+            ct_headers = generate_headers()
             home_page = cffi_session.get(
                 "https://x.com", headers=ct_headers, timeout=10,
             )
-            home_page_response = bs4.BeautifulSoup(home_page.content, "html.parser")
+            home_page_response = BeautifulSoup(home_page.content, "html.parser")
             ondemand_url = get_ondemand_file_url(response=home_page_response)
             if not ondemand_url:
                 raise ValueError("Failed to extract ondemand file URL from homepage")
@@ -1159,6 +1137,7 @@ class TwitterClient:
             headers["Content-Type"] = "application/json"
             headers["Referer"] = "https://x.com/compose/post"
             headers["Priority"] = "u=1, i"
+            self._ensure_client_transaction()
         # Generate x-client-transaction-id if available
         if self._client_transaction and url:
             try:
