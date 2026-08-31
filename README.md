@@ -16,6 +16,13 @@ Reinstall after dependency or entrypoint changes:
 uv tool install --editable --force ~/projects/twitter-cli
 ```
 
+Install the companion agent skill with a symlink so it follows repository updates:
+
+```bash
+ln -s ~/projects/twitter-cli/.agents/skills/twitter-cli \
+  ~/.agents/skills/twitter-cli
+```
+
 ## Authentication
 
 The CLI discovers logged-in profiles for Zen, Firefox, LibreWolf, Chrome, Chromium, Brave,

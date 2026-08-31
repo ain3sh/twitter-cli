@@ -47,6 +47,8 @@ uv run pytest -m smoke -v
 - Config lives under XDG config; caches live under XDG cache.
 - Config parsing is strict and uses only the shape documented in README.md.
 - Keep `twitter_cli.__version__` and `project.version` synchronized.
+- `.agents/skills/twitter-cli/` is the canonical companion skill. Update it in the same
+  change whenever commands, flags, output shapes, authentication, or safety semantics change.
 
 ## Modules
 

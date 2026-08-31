@@ -1,12 +1,6 @@
 ---
 name: twitter-cli
 description: Use the local twitter CLI for Twitter/X reads and user-approved account actions.
-author: ain3sh
-version: "0.8.6"
-tags:
-  - twitter
-  - x
-  - cli
 ---
 
 # twitter-cli
